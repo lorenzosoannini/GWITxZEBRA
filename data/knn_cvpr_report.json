@@ -1,0 +1,7 @@
+{
+  "dataset": "luigi-s/EEG_Image_CVPR_ALL_subj",
+  "ckpt": "/content/drive/My Drive/GWIT2/data/eegfeat_cvpr.pth",
+  "k": 3,
+  "batch_size": 256,
+  "seed": 0
+}
