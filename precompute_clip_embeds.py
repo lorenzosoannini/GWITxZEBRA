@@ -10,16 +10,20 @@ from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Precompute CLIP image embeddings for full EEG dataset pool, saved subject-wise."
+        description="Precompute CLIP image embeddings (sequence-level) for EEG dataset."
     )
     parser.add_argument("--dataset_name", type=str, required=True)
-    parser.add_argument("--subjects", type=int, nargs="+", required=True,
-                        help="Subjects to process, e.g. 1 2 3 4 5 6")
+    parser.add_argument("--subjects", type=int, nargs="+", required=True)
     parser.add_argument("--image_column", type=str, default="image")
     parser.add_argument("--cache_dir", type=str, default=None)
     parser.add_argument("--clip_model_name", type=str, default="openai/clip-vit-base-patch32")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--output_root", type=str, required=True)
+
+    # 🔥 NEW FLAG
+    parser.add_argument("--use_sequence", action="store_true",
+                        help="Use sequence-level CLIP embeddings instead of pooled")
+
     return parser.parse_args()
 
 
@@ -32,8 +36,7 @@ def load_full_hf_pool(dataset_name, cache_dir=None):
     ds_val = ds_val.add_column("__hf_split__", ["validation"] * len(ds_val))
     ds_test = ds_test.add_column("__hf_split__", ["test"] * len(ds_test))
 
-    full_ds = concatenate_datasets([ds_train, ds_val, ds_test])
-    return full_ds
+    return concatenate_datasets([ds_train, ds_val, ds_test])
 
 
 def build_subject_index_map(full_data, subjects):
@@ -56,14 +59,14 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print("[INFO] Loading CLIP processor/model...")
+    print("[INFO] Loading CLIP...")
     processor = CLIPImageProcessor.from_pretrained(args.clip_model_name)
     model = CLIPVisionModelWithProjection.from_pretrained(args.clip_model_name).to(device)
     model.eval()
 
-    print("[INFO] Loading full HF pool...")
+    print("[INFO] Loading dataset...")
     full_ds = load_full_hf_pool(args.dataset_name, cache_dir=args.cache_dir)
-    print(f"[INFO] Full pool size: {len(full_ds)}")
+    print(f"[INFO] Total samples: {len(full_ds)}")
 
     subject_to_indices = build_subject_index_map(full_ds, args.subjects)
 
@@ -77,40 +80,38 @@ def main():
         n_subj = len(subj_indices)
 
         if n_subj == 0:
-            print(f"[WARN] Subject {subj} has 0 samples, skipping.")
+            print(f"[WARN] Subject {subj} empty")
             continue
 
-        print(f"[INFO] Subject {subj}: {n_subj} samples")
+        print(f"[INFO] subj{subj}: {n_subj} samples")
 
         subj_dir = os.path.join(base_out_dir, f"subj{subj}")
         os.makedirs(subj_dir, exist_ok=True)
 
         out_path = os.path.join(subj_dir, "clip_img_embeds.npy")
 
-        # Resume support
         all_embs = []
         start_idx = 0
 
+        # Resume
         if os.path.exists(out_path):
             existing = np.load(out_path)
             all_embs = [x for x in existing]
             start_idx = len(existing)
-            print(f"[INFO] Resuming subj{subj} from {start_idx}/{n_subj}")
+            print(f"[INFO] Resume from {start_idx}/{n_subj}")
 
-        for i in tqdm(range(start_idx, n_subj, args.batch_size), desc=f"subj{subj}", mininterval=1):
+        for i in tqdm(range(start_idx, n_subj, args.batch_size), desc=f"subj{subj}"):
             batch_local_idx = list(range(i, min(i + args.batch_size, n_subj)))
             batch_global_idx = [subj_indices[j] for j in batch_local_idx]
 
             batch = full_ds.select(batch_global_idx)
             images = batch[args.image_column]
 
-            # HF image feature is usually already PIL-like; enforce RGB
             pil_images = []
             for img in images:
                 if hasattr(img, "convert"):
                     pil_images.append(img.convert("RGB"))
                 else:
-                    # fallback if needed
                     from PIL import Image
                     pil_images.append(Image.fromarray(np.array(img)).convert("RGB"))
 
@@ -119,24 +120,29 @@ def main():
 
             with torch.no_grad():
                 out = model(pixel_values=pixel_values)
-                emb = out.image_embeds
-                emb = F.normalize(emb, dim=-1)
 
-            emb_np = emb.detach().cpu().float().numpy().astype(np.float32)
+                if args.use_sequence:
+                    # 🔥 KEY CHANGE
+                    tokens = out.last_hidden_state[:, 1:, :]  # remove CLS → (B, T, D)
+                    tokens = F.normalize(tokens, dim=-1)
+                    emb = tokens
+                else:
+                    emb = out.image_embeds
+                    emb = F.normalize(emb, dim=-1)
+
+            emb_np = emb.cpu().float().numpy().astype(np.float32)
             all_embs.extend(list(emb_np))
 
-            # Save progressively
             np.save(out_path, np.array(all_embs, dtype=np.float32))
 
         final_embs = np.array(all_embs, dtype=np.float32)
         np.save(out_path, final_embs)
 
-        print(f"[DONE] subj{subj} -> {out_path} | shape={final_embs.shape}")
+        print(f"[DONE] subj{subj} → shape={final_embs.shape}")
 
-    print("===========================================")
-    print("✔ CLIP embedding precomputation completed.")
-    print(f"✔ Output root: {base_out_dir}")
-    print("===========================================")
+    print("=================================")
+    print("✔ CLIP precompute DONE")
+    print("=================================")
 
 
 if __name__ == "__main__":

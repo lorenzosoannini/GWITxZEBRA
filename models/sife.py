@@ -39,18 +39,34 @@ class SelfAttentionBlock(nn.Module):
 # Fi(.) module (EEG-irrelevant / subject-invariant extractor)
 # ---------------------------------------------------------
 class FiModule(nn.Module):
-    def __init__(self, dim: int, num_layers: int = 2, num_heads: int = 4, dropout: float = 0.1):
+    def __init__(
+        self,
+        dim: int,
+        seq_len: int,
+        num_layers: int = 2,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+    ):
         super().__init__()
+        self.seq_len = seq_len
+        self.pos_embed = nn.Parameter(torch.zeros(1, seq_len, dim))
+
         self.layers = nn.ModuleList([
             SelfAttentionBlock(dim, num_heads=num_heads, dropout=dropout)
             for _ in range(num_layers)
         ])
 
-        # projection -> E_i_seq
         self.proj = nn.Linear(dim, dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, D)
+        if x.size(1) != self.seq_len:
+            raise ValueError(
+                f"FiModule expected seq_len={self.seq_len}, got T={x.size(1)}"
+            )
+
+        x = x + self.pos_embed
+
         for layer in self.layers:
             x = layer(x)
 
@@ -59,21 +75,39 @@ class FiModule(nn.Module):
 
 
 # ---------------------------------------------------------
-# Small MLP head for subject prediction
+# Token-level MLP head for subject prediction
 # ---------------------------------------------------------
 class SubjectHead(nn.Module):
-    def __init__(self, dim: int, num_classes: int, hidden_dim: int = None, dropout: float = 0.1):
+    def __init__(
+        self,
+        dim: int,
+        seq_len: int,
+        num_classes: int,
+        hidden_dim: int = None,
+        dropout: float = 0.1,
+    ):
         super().__init__()
         hidden_dim = hidden_dim or dim
 
+        self.seq_len = seq_len
         self.net = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
+            nn.Flatten(start_dim=1),                  # (B, T, D) -> (B, T*D)
+            nn.Linear(seq_len * dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError(f"Expected x with shape (B, T, D), got {tuple(x.shape)}")
+        if x.size(1) != self.seq_len:
+            raise ValueError(
+                f"SubjectHead expected seq_len={self.seq_len}, got T={x.size(1)}"
+            )
         return self.net(x)
 
 
@@ -93,6 +127,7 @@ class SIFE(nn.Module):
     def __init__(
         self,
         dim: int = 128,
+        seq_len: int = 77,
         num_subjects: int = 3,
         fi_layers: int = 2,
         num_heads: int = 4,
@@ -106,29 +141,30 @@ class SIFE(nn.Module):
             raise ValueError(f"SIFE requires at least 2 active subject classes, got {num_subjects}.")
 
         self.dim = dim
+        self.seq_len = seq_len
         self.num_subjects = num_subjects
 
         self.fi = FiModule(
             dim=dim,
+            seq_len=seq_len,
             num_layers=fi_layers,
             num_heads=num_heads,
             dropout=dropout,
         )
 
-        # GRL for subject-invariant branch
         self.grl = GRL(lambda_=grl_lambda)
 
-        # subject discriminator (for E_i, adversarial branch)
         self.subject_discriminator = SubjectHead(
             dim=dim,
+            seq_len=seq_len,
             num_classes=num_subjects,
             hidden_dim=classifier_hidden_dim,
             dropout=dropout,
         )
 
-        # subject classifier (for E_s, subject-specific branch)
         self.subject_classifier = SubjectHead(
             dim=dim,
+            seq_len=seq_len,
             num_classes=num_subjects,
             hidden_dim=classifier_hidden_dim,
             dropout=dropout,
@@ -143,36 +179,33 @@ class SIFE(nn.Module):
             dict with:
               - E_i_seq: (B, T, D)
               - E_s_seq: (B, T, D)
-              - E_i:     (B, D)
-              - E_s:     (B, D)
-              - pred_subject_i: (B, K)
-              - pred_subject_s: (B, K)
+              - E_i:     (B, D)   [solo per monitoring]
+              - E_s:     (B, D)   [solo per monitoring]
+              - pred_subject_i: (B, K) from token-level E_i_seq
+              - pred_subject_s: (B, K) from token-level E_s_seq
         """
         if E_seq.ndim != 3:
             raise ValueError(f"Expected E_seq with shape (B, T, D), got {tuple(E_seq.shape)}")
 
-        # ---------------------------------------------------------
+        if E_seq.size(1) != self.seq_len:
+            raise ValueError(
+                f"SIFE expected seq_len={self.seq_len}, got T={E_seq.size(1)}"
+            )
+
         # Step 1: compute E_i
-        # ---------------------------------------------------------
         E_i_seq = self.fi(E_seq)  # (B, T, D)
 
-        # ---------------------------------------------------------
         # Step 2: compute E_s
-        # ---------------------------------------------------------
         E_s_seq = E_seq - E_i_seq
 
-        # ---------------------------------------------------------
-        # Step 3: temporal pooling
-        # ---------------------------------------------------------
+        # solo per monitoring/debug
         E_i = E_i_seq.mean(dim=1)  # (B, D)
         E_s = E_s_seq.mean(dim=1)  # (B, D)
 
-        # ---------------------------------------------------------
-        # Step 4: adversarial + classification
-        # ---------------------------------------------------------
-        E_i_grl = self.grl(E_i)
-        pred_subject_i = self.subject_discriminator(E_i_grl)  # (B, K)
-        pred_subject_s = self.subject_classifier(E_s)         # (B, K)
+        # Step 4: adversarial + classification on token-level sequences
+        E_i_seq_grl = self.grl(E_i_seq)
+        pred_subject_i = self.subject_discriminator(E_i_seq_grl)  # (B, K)
+        pred_subject_s = self.subject_classifier(E_s_seq)         # (B, K)
 
         return {
             "E_i_seq": E_i_seq,

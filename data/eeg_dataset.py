@@ -135,6 +135,10 @@ class EEGImageDataset(Dataset):
                     clip_img_embeds.npy
             or
             clip_embeds_dir/<safe_dataset_name>/subj1/...
+
+        Supported shapes:
+            pooled:   (N, D)
+            sequence: (N, T, D)
     """
 
     def __init__(
@@ -173,6 +177,7 @@ class EEGImageDataset(Dataset):
 
         self.use_precomputed_clip_embeds = bool(use_precomputed_clip_embeds)
         self.clip_embeds_dir = clip_embeds_dir
+        self.clip_embed_rank = None  # 2 for pooled, 3 for sequence
 
         self.val_ratio = float(val_ratio)
         self.split_seed = int(split_seed)
@@ -330,11 +335,27 @@ class EEGImageDataset(Dataset):
                     f"CLIP embeds length mismatch for subj{subj}: "
                     f"{len(clip_embeds)} vs full-pool subject samples {n_subj}"
                 )
-                assert clip_embeds.ndim == 2, (
-                    f"Expected 2D CLIP embeds for subj{subj}, got shape {clip_embeds.shape}"
-                )
+
+                if clip_embeds.ndim not in (2, 3):
+                    raise ValueError(
+                        f"Expected CLIP embeds with shape (N, D) or (N, T, D) for subj{subj}, "
+                        f"got shape {clip_embeds.shape}"
+                    )
+
+                if self.clip_embed_rank is None:
+                    self.clip_embed_rank = clip_embeds.ndim
+                else:
+                    assert self.clip_embed_rank == clip_embeds.ndim, (
+                        f"Inconsistent CLIP embed rank across subjects: "
+                        f"previous rank={self.clip_embed_rank}, subj{subj} rank={clip_embeds.ndim}"
+                    )
 
                 self.clip_embeds_by_subject[subj] = clip_embeds
+
+                print(
+                    f"[EEG DATASET] Loaded CLIP embeds for subj{subj}: shape={clip_embeds.shape} "
+                    f"| mode={'sequence' if clip_embeds.ndim == 3 else 'pooled'}"
+                )
 
             # ---------------------------------------------
             # Save mapping final idx -> (subject, local_idx)
@@ -362,6 +383,12 @@ class EEGImageDataset(Dataset):
             f"[EEG DATASET] Final dataset | mode={self.subset_mode} | "
             f"subjects={self.subjects} | total={len(self.data)}"
         )
+
+        if self.use_precomputed_clip_embeds:
+            print(
+                f"[EEG DATASET] CLIP embedding mode: "
+                f"{'sequence-level' if self.clip_embed_rank == 3 else 'pooled'}"
+            )
 
     def __len__(self):
         return len(self.data)
@@ -396,6 +423,9 @@ class EEGImageDataset(Dataset):
             clip_img_embeds = torch.from_numpy(
                 self.clip_embeds_by_subject[subj][local_idx]
             ).float()
+
+            # pooled  -> (D)
+            # seq-lvl -> (T, D)
             clip_img_embeds = F.normalize(clip_img_embeds, dim=-1)
 
         # ---------------------------------------------------------
@@ -408,6 +438,11 @@ class EEGImageDataset(Dataset):
         # Subject ID
         # ---------------------------------------------------------
         subject = torch.tensor(int(example["subject"]), dtype=torch.long)
+
+        # ---------------------------------------------------------
+        # Image label
+        # ---------------------------------------------------------
+        image_label = torch.tensor(int(example["label"]), dtype=torch.long)
 
         # ---------------------------------------------------------
         # Caption logic
@@ -436,6 +471,8 @@ class EEGImageDataset(Dataset):
             "conditioning_pixel_values": cond,
             "input_ids": tokens.input_ids.squeeze(0),
             "eeg_subjects": subject,
+            "image_labels": image_label,
+            "caption_text": caption,
         }
 
         if self.use_precomputed_latents:
