@@ -38,6 +38,151 @@ def _maybe_resize_tokens(x: torch.Tensor, target_tokens: int) -> torch.Tensor:
     return x
 
 
+def _build_positive_mask_from_group_ids(group_ids: torch.Tensor) -> torch.Tensor:
+    """
+    group_ids: (B,)
+    returns:
+        positive_mask: (B, B) bool
+    """
+    if group_ids.ndim != 1:
+        raise ValueError(f"group_ids must be 1D, got shape {tuple(group_ids.shape)}")
+
+    return group_ids[:, None] == group_ids[None, :]
+
+
+def _multi_positive_contrastive_directional_loss(
+    query: torch.Tensor,
+    target: torch.Tensor,
+    positive_mask: torch.Tensor,
+    temperature: float = 0.07,
+    exclude_self: bool = False,
+) -> torch.Tensor:
+    """
+    Directional multi-positive contrastive loss.
+
+    query:         (B, D)
+    target:        (B, D)
+    positive_mask: (B, B) bool, where positive_mask[i,j]=True means j is a positive for i
+
+    If exclude_self=True, the diagonal is removed from positives.
+    Rows with zero positives after masking are ignored.
+    """
+    if query.ndim != 2 or target.ndim != 2:
+        raise ValueError(
+            f"_multi_positive_contrastive_directional_loss expects 2D tensors. "
+            f"Got query={tuple(query.shape)}, target={tuple(target.shape)}"
+        )
+
+    if query.shape[0] != target.shape[0]:
+        raise ValueError(
+            f"query and target must have same batch size, got {query.shape[0]} vs {target.shape[0]}"
+        )
+
+    if positive_mask.shape != (query.shape[0], target.shape[0]):
+        raise ValueError(
+            f"positive_mask must have shape {(query.shape[0], target.shape[0])}, "
+            f"got {tuple(positive_mask.shape)}"
+        )
+
+    query = _normalize(query)
+    target = _normalize(target)
+
+    logits = (query @ target.t()) / temperature
+    log_probs = F.log_softmax(logits, dim=-1)
+
+    pos_mask = positive_mask.to(device=query.device, dtype=torch.bool)
+
+    if exclude_self:
+        diag = torch.eye(pos_mask.shape[0], device=pos_mask.device, dtype=torch.bool)
+        pos_mask = pos_mask & (~diag)
+
+    pos_mask_f = pos_mask.float()
+    pos_count = pos_mask_f.sum(dim=-1)  # (B,)
+
+    valid_rows = pos_count > 0
+    if not valid_rows.any():
+        # fallback sicuro: se non esistono positivi multipli,
+        # usiamo la diagonale standard
+        labels = torch.arange(query.shape[0], device=query.device)
+        return F.cross_entropy(logits, labels)
+
+    # average log-prob over positives for each query row
+    loss_per_row = -((log_probs * pos_mask_f).sum(dim=-1) / pos_count.clamp_min(1.0))
+    loss = loss_per_row[valid_rows].mean()
+    return loss
+
+
+def multi_positive_info_nce_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    group_ids: torch.Tensor,
+    temperature: float = 0.07,
+    exclude_self: bool = False,
+) -> torch.Tensor:
+    """
+    Symmetric multi-positive InfoNCE.
+
+    Positives are defined by equality of group_ids.
+    """
+    if pred.ndim != 2 or target.ndim != 2:
+        raise ValueError(
+            f"multi_positive_info_nce_loss expects 2D tensors. "
+            f"Got pred={tuple(pred.shape)}, target={tuple(target.shape)}"
+        )
+
+    if group_ids.ndim != 1:
+        raise ValueError(f"group_ids must be 1D, got shape {tuple(group_ids.shape)}")
+
+    if pred.shape[0] != target.shape[0] or pred.shape[0] != group_ids.shape[0]:
+        raise ValueError(
+            f"Batch size mismatch: pred={pred.shape[0]}, target={target.shape[0]}, group_ids={group_ids.shape[0]}"
+        )
+
+    positive_mask = _build_positive_mask_from_group_ids(group_ids.to(pred.device))
+
+    loss_pt = _multi_positive_contrastive_directional_loss(
+        query=pred,
+        target=target,
+        positive_mask=positive_mask,
+        temperature=temperature,
+        exclude_self=exclude_self,
+    )
+
+    loss_tp = _multi_positive_contrastive_directional_loss(
+        query=target,
+        target=pred,
+        positive_mask=positive_mask.t(),
+        temperature=temperature,
+        exclude_self=exclude_self,
+    )
+
+    return 0.5 * (loss_pt + loss_tp)
+
+
+def multi_positive_sequence_info_nce_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    group_ids: torch.Tensor,
+    temperature: float = 0.07,
+    exclude_self: bool = False,
+) -> torch.Tensor:
+    if pred.shape != target.shape:
+        raise ValueError(
+            f"multi_positive_sequence_info_nce_loss requires same shape for pred and target, "
+            f"got pred={tuple(pred.shape)} vs target={tuple(target.shape)}"
+        )
+
+    pred_flat = _flatten_sequence(pred)
+    target_flat = _flatten_sequence(target)
+    return multi_positive_info_nce_loss(
+        pred_flat,
+        target_flat,
+        group_ids=group_ids,
+        temperature=temperature,
+        exclude_self=exclude_self,
+    )
+
+
 # ---------------------------------------------------------
 # OPTIONAL SIMPLE ADAPTER
 # ---------------------------------------------------------
@@ -434,7 +579,6 @@ class SSFEProjector(nn.Module):
             self.general_projector.set_gradient_checkpointing(enable)
         if hasattr(self.semantic_projector, "set_gradient_checkpointing"):
             self.semantic_projector.set_gradient_checkpointing(enable)
-
 
     def forward(
         self,

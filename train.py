@@ -38,7 +38,11 @@ from data.eeg_dataset import (
 from models.eeg_backbone import GWITEEGBackbone, load_eeg_backbone_from_ckpt
 from models.sife import SIFE
 from models.eeg_reconstruction import EEGReconstructionDecoder
-from models.ssfe import SSFEProjector, info_nce_loss, sequence_info_nce_loss
+from models.ssfe import (
+    SSFEProjector,
+    multi_positive_info_nce_loss,
+    multi_positive_sequence_info_nce_loss,
+)
 from models.prior import PriorNetwork, BrainDiffusionPrior
 
 # W&B
@@ -86,6 +90,24 @@ def remap_subject_targets(subjects_tensor: torch.Tensor, subject_to_local: dict)
     device = subjects_tensor.device
     remapped = [subject_to_local[int(s)] for s in subjects_tensor.detach().cpu().tolist()]
     return torch.tensor(remapped, device=device, dtype=torch.long)
+
+def get_group_ids_from_batch(batch, key: str, device: torch.device) -> torch.Tensor:
+    if key not in batch:
+        raise KeyError(
+            f"Missing required batch key '{key}'. "
+            f"Make sure eeg_dataset.py returns it in __getitem__."
+        )
+
+    group_ids = batch[key]
+    if not isinstance(group_ids, torch.Tensor):
+        group_ids = torch.tensor(group_ids, device=device, dtype=torch.long)
+    else:
+        group_ids = group_ids.to(device=device, dtype=torch.long)
+
+    if group_ids.ndim != 1:
+        raise ValueError(f"Expected {key} to be 1D after collate, got shape {tuple(group_ids.shape)}")
+
+    return group_ids
 
 
 # ---------------------------------------------------------
@@ -297,6 +319,23 @@ def run_validation_metrics(
                 dtype=torch.long,
             )
 
+            visual_group_ids = None
+            text_group_ids = None
+
+            if ssfe_projector is not None:
+                if args.lambda_anchor_visual > 0.0:
+                    visual_group_ids = get_group_ids_from_batch(
+                        batch,
+                        "visual_group_ids",
+                        accelerator.device,
+                    )
+                if args.lambda_anchor_text > 0.0:
+                    text_group_ids = get_group_ids_from_batch(
+                        batch,
+                        "text_group_ids",
+                        accelerator.device,
+                    )
+
             bsz = eeg_cond.shape[0]
             bsz_t = total.new_tensor(float(bsz))
             total += bsz_t
@@ -399,10 +438,12 @@ def run_validation_metrics(
                         dtype=ssfe_param_dtype,
                     )
 
-                    loss_anchor_visual = sequence_info_nce_loss(
+                    loss_anchor_visual = multi_positive_sequence_info_nce_loss(
                         F_anchor_visual.float(),
                         clip_target_ssfe.float(),
+                        group_ids=visual_group_ids,
                         temperature=args.anchor_visual_temperature,
+                        exclude_self=False,
                     )
 
                     loss_anchor_visual_tot += loss_anchor_visual * bsz_t
@@ -417,10 +458,9 @@ def run_validation_metrics(
                     )
 
                     sim = pred_flat @ tgt_flat.t()
-                    top1 = (
-                        sim.argmax(dim=1)
-                        == torch.arange(sim.shape[0], device=sim.device)
-                    ).float().mean()
+                    top1_idx = sim.argmax(dim=1)
+                    top1_group = visual_group_ids[top1_idx]
+                    top1 = (top1_group == visual_group_ids).float().mean()
 
                     top1_anchor_tot += top1 * bsz_t
 
@@ -430,10 +470,12 @@ def run_validation_metrics(
                         dtype=ssfe_param_dtype,
                     )
 
-                    loss_anchor_text = info_nce_loss(
+                    loss_anchor_text = multi_positive_info_nce_loss(
                         ssfe_out["anchor_text_embed"].float(),
                         text_target.float(),
+                        group_ids=text_group_ids,
                         temperature=args.anchor_text_temperature,
+                        exclude_self=False,
                     )
 
                     loss_anchor_text_tot += loss_anchor_text * bsz_t
@@ -1572,6 +1614,23 @@ def main(args):
                     dtype=torch.long,
                 )
 
+                visual_group_ids = None
+                text_group_ids = None
+
+                if args.use_ssfe and (stage2_mode or full_mode):
+                    if args.lambda_anchor_visual > 0.0:
+                        visual_group_ids = get_group_ids_from_batch(
+                            batch,
+                            "visual_group_ids",
+                            accelerator.device,
+                        )
+                    if args.lambda_anchor_text > 0.0:
+                        text_group_ids = get_group_ids_from_batch(
+                            batch,
+                            "text_group_ids",
+                            accelerator.device,
+                        )
+
                 # ---------------------------------------------------------
                 # GWIT EEG backbone (+ optional SIFE)
                 # ---------------------------------------------------------
@@ -1779,10 +1838,12 @@ def main(args):
                                 f"with shape (B, T, D), got {tuple(clip_target_ssfe.shape)}"
                             )
 
-                        anchor_visual_loss = sequence_info_nce_loss(
+                        anchor_visual_loss = multi_positive_sequence_info_nce_loss(
                             F_anchor_visual.float(),
                             clip_target_ssfe.float(),
+                            group_ids=visual_group_ids,
                             temperature=args.anchor_visual_temperature,
+                            exclude_self=False,
                         )
 
                     if args.lambda_anchor_text > 0.0:
@@ -1791,10 +1852,12 @@ def main(args):
                             dtype=ssfe_dtype,
                         )
 
-                        anchor_text_loss = info_nce_loss(
+                        anchor_text_loss = multi_positive_info_nce_loss(
                             anchor_text_embed.float(),
                             text_target.float(),
+                            group_ids=text_group_ids,
                             temperature=args.anchor_text_temperature,
+                            exclude_self=False,
                         )
 
                     ssfe_loss = (
@@ -1819,6 +1882,10 @@ def main(args):
                         accelerator.print(f"[DEBUG] image_labels shape: {tuple(image_labels.shape)}")
                         if clip_target_ssfe is not None:
                             accelerator.print(f"[DEBUG] clip_target_ssfe shape: {tuple(clip_target_ssfe.shape)}")
+                        if visual_group_ids is not None:
+                            accelerator.print(f"[DEBUG] visual_group_ids shape: {tuple(visual_group_ids.shape)}")
+                        if text_group_ids is not None:
+                            accelerator.print(f"[DEBUG] text_group_ids shape: {tuple(text_group_ids.shape)}")
 
                 elif ssfe_projector is not None and stage3_mode:
                     if E_i_seq is None:

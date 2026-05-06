@@ -1,24 +1,16 @@
 import os
-import hashlib
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
-import numpy as np
 from datasets import load_dataset, concatenate_datasets
-from torchvision import transforms
 
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
-# ---------------------------------------------------------
-# Stable Diffusion normalization for real images
-# ---------------------------------------------------------
-to_tensor = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Resize((512, 512), antialias=True),
-    transforms.Lambda(lambda x: x * 2.0 - 1.0),
-])
 
-
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
 def _normalize_subject_list(subjects):
     if subjects is None:
         return None
@@ -56,6 +48,13 @@ def _limit_indices_per_subject(indices, max_samples_per_subject=None):
 
 
 def _load_full_hf_pool(dataset_name, cache_dir=None):
+    """
+    Loads and concatenates train + validation + test HF splits.
+
+    This keeps the same subject-wise split logic you were using before:
+    first build a full pool per subject, then create deterministic local
+    train/val splits.
+    """
     ds_train = load_dataset(dataset_name, split="train", cache_dir=cache_dir)
     ds_val = load_dataset(dataset_name, split="validation", cache_dir=cache_dir)
     ds_test = load_dataset(dataset_name, split="test", cache_dir=cache_dir)
@@ -64,14 +63,15 @@ def _load_full_hf_pool(dataset_name, cache_dir=None):
     ds_val = ds_val.add_column("__hf_split__", ["validation"] * len(ds_val))
     ds_test = ds_test.add_column("__hf_split__", ["test"] * len(ds_test))
 
-    full_ds = concatenate_datasets([ds_train, ds_val, ds_test])
-    return full_ds
+    return concatenate_datasets([ds_train, ds_val, ds_test])
 
 
 def _build_subject_index_map(full_data, subjects):
     """
-    Build a mapping: subject_id -> list of global indices in full_data.
-    Single pass over subject column, avoids repeated dataset.filter calls.
+    Build a mapping:
+        subject_id -> list of global indices in full_data
+
+    Single pass over the subject column. This avoids repeated dataset.filter calls.
     """
     subject_set = set(int(s) for s in subjects)
     subject_to_indices = {int(s): [] for s in subjects}
@@ -108,42 +108,48 @@ def _resolve_subject_subdir(root_dir, dataset_name, subj):
     )
 
 
+# ---------------------------------------------------------
+# EEG-only dataset
+# ---------------------------------------------------------
 class EEGImageDataset(Dataset):
     """
-    Subject-aware GWIT/ZEBRA dataset loader.
+    Clean EEG-only/ZEBRA-style dataset loader.
 
-    Pool source:
-        - all HF splits combined: train + validation + test
+    This version intentionally removes all GWIT/Stable-Diffusion-specific parts:
+      - no tokenizer
+      - no input_ids
+      - no caption classifier
+      - no caption_text
+      - no pixel_values
+      - no VAE latents
+      - no posterior_mean/posterior_logvar
 
-    subset_mode:
-        - "train": train subset of seen subjects
-        - "val":   validation subset of seen subjects
-        - "test":  all samples of unseen/test subjects
+    Returned fields:
+      - conditioning_pixel_values: EEG tensor, usually (C, T)
+      - eeg_subjects: original subject id
+      - image_labels: image/class label
+      - visual_group_ids: stable instance-level id
+      - text_group_ids: class-level id
+      - clip_img_embeds: optional precomputed CLIP image embedding/tokens
+      - clip_text_embeds: optional precomputed CLIP text embedding
 
-    Latents (optional):
-        Expected structure:
-            latents_dir/
-                subj1/
-                    posterior_mean.npy
-                    posterior_logvar.npy
-            or
-            latents_dir/<safe_dataset_name>/subj1/...
+    CLIP embeds expected structure:
+        clip_embeds_dir/
+            subj1/
+                clip_img_embeds.npy
+                clip_text_embeds.npy
 
-    CLIP embeds (optional):
-        Expected structure:
-            clip_embeds_dir/
-                subj1/
-                    clip_img_embeds.npy
-                    clip_text_embeds.npy
-            or
-            clip_embeds_dir/<safe_dataset_name>/subj1/...
+        or:
+        clip_embeds_dir/<safe_dataset_name>/subj1/
+            clip_img_embeds.npy
+            clip_text_embeds.npy
 
-        Supported image shapes:
-            pooled:   (N, D)
-            sequence: (N, T, D)
+    Supported image CLIP shapes:
+        pooled:   (N, D)
+        sequence: (N, T, D)
 
-        Supported text shapes:
-            pooled:   (N, D)
+    Supported text CLIP shapes:
+        pooled:   (N, D)
     """
 
     def __init__(
@@ -151,15 +157,10 @@ class EEGImageDataset(Dataset):
         dataset_name,
         subjects,
         subset_mode,
-        image_column,
         conditioning_image_column,
-        caption_column,
-        tokenizer,
         args,
-        root,
-        accelerator,
-        use_precomputed_latents: bool = False,
-        latents_dir: str = None,
+        root=None,
+        accelerator=None,
         use_precomputed_clip_embeds: bool = False,
         clip_embeds_dir: str = None,
         val_ratio: float = 0.1,
@@ -169,20 +170,14 @@ class EEGImageDataset(Dataset):
         self.dataset_name = dataset_name
         self.subjects = _normalize_subject_list(subjects)
         self.subset_mode = subset_mode
-        self.image_column = image_column
         self.cond_column = conditioning_image_column
-        self.caption_column = caption_column
-        self.tokenizer = tokenizer
         self.args = args
         self.root = root
         self.accelerator = accelerator
 
-        self.use_precomputed_latents = bool(use_precomputed_latents)
-        self.latents_dir = latents_dir
-
         self.use_precomputed_clip_embeds = bool(use_precomputed_clip_embeds)
         self.clip_embeds_dir = clip_embeds_dir
-        self.clip_embed_rank = None  # 2 for pooled, 3 for sequence
+        self.clip_embed_rank = None
         self.clip_text_embed_dim = None
 
         self.val_ratio = float(val_ratio)
@@ -201,30 +196,11 @@ class EEGImageDataset(Dataset):
             f"Invalid subset_mode={self.subset_mode}"
 
         # ---------------------------------------------------------
-        # Captioner
-        # ---------------------------------------------------------
-        if getattr(args, "caption_from_classifier", False):
-            from .caption_classifier import EEGCaptionClassifier
-
-            if accelerator is not None:
-                captioner_device = accelerator.device
-            else:
-                captioner_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-            self.captioner = EEGCaptionClassifier(
-                dataset_name=dataset_name,
-                root=root,
-                device=str(captioner_device),
-            )
-        else:
-            self.captioner = None
-
-        # ---------------------------------------------------------
         # Load full HF dataset pool
         # ---------------------------------------------------------
         full_data = _load_full_hf_pool(
             dataset_name=dataset_name,
-            cache_dir=args.cache_dir,
+            cache_dir=getattr(args, "cache_dir", None),
         )
         print(f"[EEG DATASET] Loaded full HF pool: {len(full_data)} samples")
 
@@ -234,20 +210,16 @@ class EEGImageDataset(Dataset):
         subject_to_indices = _build_subject_index_map(full_data, self.subjects)
         n_after_subject_filter = sum(len(v) for v in subject_to_indices.values())
         print(
-            f"[EEG DATASET] After subject index map {self.subjects}: {n_after_subject_filter} samples"
+            f"[EEG DATASET] After subject index map {self.subjects}: "
+            f"{n_after_subject_filter} samples"
         )
 
         # ---------------------------------------------------------
-        # Optional containers
+        # Optional CLIP containers
         # ---------------------------------------------------------
-        self.latents_by_subject = None
-        if self.use_precomputed_latents:
-            assert self.latents_dir is not None, \
-                "You must set latents_dir if use_precomputed_latents=True"
-            self.latents_by_subject = {}
-
         self.clip_embeds_by_subject = None
         self.clip_text_embeds_by_subject = None
+
         if self.use_precomputed_clip_embeds:
             assert self.clip_embeds_dir is not None, \
                 "You must set clip_embeds_dir if use_precomputed_clip_embeds=True"
@@ -268,26 +240,23 @@ class EEGImageDataset(Dataset):
                 print(f"[EEG DATASET] Warning: subject {subj} has 0 samples")
                 continue
 
-            # split on local indices [0..n_subj-1]
+            # Split on local indices [0..n_subj-1].
             if self.subset_mode in {"train", "val"}:
                 train_idx, val_idx = _split_indices_deterministic(
                     n=n_subj,
                     val_ratio=self.val_ratio,
-                    seed=self.split_seed + subj,
+                    seed=self.split_seed + int(subj),
                 )
                 keep_local_idx = train_idx if self.subset_mode == "train" else val_idx
             else:
                 keep_local_idx = list(range(n_subj))
 
-            # optional per-subject cap
             keep_local_idx = _limit_indices_per_subject(
                 keep_local_idx,
                 max_samples_per_subject=self.max_samples_per_subject,
             )
 
-            # map local subject indices -> global full_data indices
             keep_global_idx = [subj_global_indices[i] for i in keep_local_idx]
-
             ds_subj_final = full_data.select(keep_global_idx)
             local_indices = keep_local_idx
 
@@ -299,34 +268,6 @@ class EEGImageDataset(Dataset):
 
             if n_kept == 0:
                 continue
-
-            # ---------------------------------------------
-            # Load subject latents
-            # ---------------------------------------------
-            if self.use_precomputed_latents:
-                subj_dir = _resolve_subject_subdir(self.latents_dir, self.dataset_name, subj)
-                mean_path = os.path.join(subj_dir, "posterior_mean.npy")
-                logv_path = os.path.join(subj_dir, "posterior_logvar.npy")
-
-                assert os.path.exists(mean_path), f"Missing {mean_path}"
-                assert os.path.exists(logv_path), f"Missing {logv_path}"
-
-                means = np.load(mean_path, mmap_mode="r")
-                logvars = np.load(logv_path, mmap_mode="r")
-
-                assert len(means) == n_subj, (
-                    f"Latents length mismatch for subj{subj}: "
-                    f"{len(means)} vs full-pool subject samples {n_subj}"
-                )
-                assert len(logvars) == n_subj, (
-                    f"Latents length mismatch for subj{subj}: "
-                    f"{len(logvars)} vs full-pool subject samples {n_subj}"
-                )
-
-                self.latents_by_subject[subj] = {
-                    "mean": means,
-                    "logvar": logvars,
-                }
 
             # ---------------------------------------------
             # Load subject CLIP image/text embeds
@@ -347,17 +288,16 @@ class EEGImageDataset(Dataset):
                     f"CLIP image embeds length mismatch for subj{subj}: "
                     f"{len(clip_embeds)} vs full-pool subject samples {n_subj}"
                 )
-
-                if clip_embeds.ndim not in (2, 3):
-                    raise ValueError(
-                        f"Expected CLIP image embeds with shape (N, D) or (N, T, D) for subj{subj}, "
-                        f"got shape {clip_embeds.shape}"
-                    )
-
                 assert len(clip_text_embeds) == n_subj, (
                     f"CLIP text embeds length mismatch for subj{subj}: "
                     f"{len(clip_text_embeds)} vs full-pool subject samples {n_subj}"
                 )
+
+                if clip_embeds.ndim not in (2, 3):
+                    raise ValueError(
+                        f"Expected CLIP image embeds with shape (N, D) or (N, T, D) "
+                        f"for subj{subj}, got shape {clip_embeds.shape}"
+                    )
 
                 if clip_text_embeds.ndim != 2:
                     raise ValueError(
@@ -366,11 +306,12 @@ class EEGImageDataset(Dataset):
                     )
 
                 if self.clip_embed_rank is None:
-                    self.clip_embed_rank = clip_embeds.ndim
+                    self.clip_embed_rank = int(clip_embeds.ndim)
                 else:
-                    assert self.clip_embed_rank == clip_embeds.ndim, (
+                    assert self.clip_embed_rank == int(clip_embeds.ndim), (
                         f"Inconsistent CLIP image embed rank across subjects: "
-                        f"previous rank={self.clip_embed_rank}, subj{subj} rank={clip_embeds.ndim}"
+                        f"previous rank={self.clip_embed_rank}, "
+                        f"subj{subj} rank={clip_embeds.ndim}"
                     )
 
                 if self.clip_text_embed_dim is None:
@@ -386,23 +327,26 @@ class EEGImageDataset(Dataset):
                 self.clip_text_embeds_by_subject[subj] = clip_text_embeds
 
                 print(
-                    f"[EEG DATASET] Loaded CLIP image embeds for subj{subj}: shape={clip_embeds.shape} "
-                    f"| mode={'sequence' if clip_embeds.ndim == 3 else 'pooled'}"
+                    f"[EEG DATASET] Loaded CLIP image embeds for subj{subj}: "
+                    f"shape={clip_embeds.shape} | "
+                    f"mode={'sequence' if clip_embeds.ndim == 3 else 'pooled'}"
                 )
                 print(
-                    f"[EEG DATASET] Loaded CLIP text embeds for subj{subj}: shape={clip_text_embeds.shape}"
+                    f"[EEG DATASET] Loaded CLIP text embeds for subj{subj}: "
+                    f"shape={clip_text_embeds.shape}"
                 )
 
             # ---------------------------------------------
             # Save mapping final idx -> (subject, local_idx)
             # ---------------------------------------------
             for li in local_indices:
-                self.sample_index_within_subject.append((subj, li))
+                self.sample_index_within_subject.append((int(subj), int(li)))
 
             per_subject_datasets.append(ds_subj_final)
 
         assert len(per_subject_datasets) > 0, (
-            f"No samples left after filtering. subjects={self.subjects}, mode={self.subset_mode}"
+            f"No samples left after filtering. subjects={self.subjects}, "
+            f"mode={self.subset_mode}"
         )
 
         self.data = (
@@ -412,7 +356,8 @@ class EEGImageDataset(Dataset):
         )
 
         assert len(self.data) == len(self.sample_index_within_subject), (
-            f"Length mismatch: data={len(self.data)} vs mapping={len(self.sample_index_within_subject)}"
+            f"Length mismatch: data={len(self.data)} "
+            f"vs mapping={len(self.sample_index_within_subject)}"
         )
 
         print(
@@ -425,9 +370,7 @@ class EEGImageDataset(Dataset):
                 f"[EEG DATASET] CLIP image embedding mode: "
                 f"{'sequence-level' if self.clip_embed_rank == 3 else 'pooled'}"
             )
-            print(
-                f"[EEG DATASET] CLIP text embedding dim: {self.clip_text_embed_dim}"
-            )
+            print(f"[EEG DATASET] CLIP text embedding dim: {self.clip_text_embed_dim}")
 
     def __len__(self):
         return len(self.data)
@@ -437,116 +380,55 @@ class EEGImageDataset(Dataset):
         subj, local_idx = self.sample_index_within_subject[idx]
 
         # ---------------------------------------------------------
-        # IMAGE or LATENTS
-        # ---------------------------------------------------------
-        raw_img_np = np.array(example[self.image_column], dtype=np.uint8)
-
-        if self.use_precomputed_latents:
-            posterior_mean = torch.from_numpy(
-                np.asarray(self.latents_by_subject[subj]["mean"][local_idx]).copy()
-            ).float()
-
-            posterior_logvar = torch.from_numpy(
-                np.asarray(self.latents_by_subject[subj]["logvar"][local_idx]).copy()
-            ).float()
-
-            img = None
-        else:
-            img = to_tensor(raw_img_np)
-            posterior_mean = None
-            posterior_logvar = None
-
-        # ---------------------------------------------------------
-        # Optional CLIP image embedding
-        # ---------------------------------------------------------
-        clip_img_embeds = None
-        if self.use_precomputed_clip_embeds:
-            clip_img_embeds = torch.from_numpy(
-                np.asarray(self.clip_embeds_by_subject[subj][local_idx]).copy()
-            ).float()
-
-            # IMPORTANTE:
-            # per il prior e per unCLIP servono i raw CLIP image tokens,
-            # quindi qui NON normalizziamo.
-            # pooled  -> (D)
-            # seq-lvl -> (T, D)
-
-        # ---------------------------------------------------------
-        # Optional CLIP text embedding
-        # ---------------------------------------------------------
-        clip_text_embeds = None
-        if self.use_precomputed_clip_embeds:
-            clip_text_embeds = torch.from_numpy(
-                np.asarray(self.clip_text_embeds_by_subject[subj][local_idx]).copy()
-            ).float()
-
-        # ---------------------------------------------------------
-        # EEG conditioning map (C,T)
+        # EEG conditioning map, usually (C, T)
         # ---------------------------------------------------------
         cond_arr = np.array(example[self.cond_column], dtype=np.float32)
         cond = torch.from_numpy(cond_arr).float()
 
         # ---------------------------------------------------------
-        # Subject ID
+        # Subject ID and image/class label
         # ---------------------------------------------------------
         subject = torch.tensor(int(example["subject"]), dtype=torch.long)
-
-        # ---------------------------------------------------------
-        # Image label
-        # ---------------------------------------------------------
         image_label = torch.tensor(int(example["label"]), dtype=torch.long)
 
         # ---------------------------------------------------------
         # Group IDs for multi-positive contrastive losses
         # ---------------------------------------------------------
-        visual_group_id = int.from_bytes(
-            hashlib.blake2b(raw_img_np.tobytes(), digest_size=8).digest(),
-            byteorder="big",
-            signed=False,
-        ) % (2**63 - 1)
-
+        # Instance-level visual id.
+        #
+        # Old GWIT-style code hashed the raw image. Here we intentionally avoid
+        # loading images. This id is stable and collision-free for practical
+        # subject/local-index ranges.
+        #
+        # Meaning:
+        #   - visual_group_ids: instance-level positives
+        #   - text_group_ids: class-level positives
+        visual_group_id = int(subj) * 1_000_000 + int(local_idx)
         text_group_id = int(example["label"])
-
-        # ---------------------------------------------------------
-        # Caption logic
-        # ---------------------------------------------------------
-        if self.captioner is not None:
-            if "CVPR" in self.dataset_name.upper():
-                eeg_for_caption = cond_arr
-            else:
-                eeg_for_caption = np.array(example["eeg_no_resample"], dtype=np.float32)
-            caption = self.captioner.predict_captions([eeg_for_caption])[0]
-        else:
-            caption = example[self.caption_column]
-
-        # ---------------------------------------------------------
-        # Tokenize
-        # ---------------------------------------------------------
-        tokens = self.tokenizer(
-            caption,
-            truncation=True,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            return_tensors="pt",
-        )
 
         out = {
             "conditioning_pixel_values": cond,
-            "input_ids": tokens.input_ids.squeeze(0),
             "eeg_subjects": subject,
             "image_labels": image_label,
-            "caption_text": caption,
             "visual_group_ids": torch.tensor(visual_group_id, dtype=torch.long),
             "text_group_ids": torch.tensor(text_group_id, dtype=torch.long),
         }
 
-        if self.use_precomputed_latents:
-            out["posterior_mean"] = posterior_mean
-            out["posterior_logvar"] = posterior_logvar
-        else:
-            out["pixel_values"] = img
-
+        # ---------------------------------------------------------
+        # Optional precomputed CLIP image/text embeddings
+        # ---------------------------------------------------------
         if self.use_precomputed_clip_embeds:
+            clip_img_embeds = torch.from_numpy(
+                np.asarray(self.clip_embeds_by_subject[subj][local_idx]).copy()
+            ).float()
+
+            clip_text_embeds = torch.from_numpy(
+                np.asarray(self.clip_text_embeds_by_subject[subj][local_idx]).copy()
+            ).float()
+
+            # Important:
+            # For SSFE/prior supervision, keep raw CLIP targets as precomputed.
+            # Do not normalize here.
             out["clip_img_embeds"] = clip_img_embeds
             out["clip_text_embeds"] = clip_text_embeds
 
@@ -561,30 +443,25 @@ def _maybe_subsample_dataset(dataset, max_samples):
         return dataset
 
     original_len = len(dataset)
-    keep = min(max_samples, original_len)
+    keep = min(int(max_samples), original_len)
 
     dataset.data = dataset.data.select(range(keep))
     if hasattr(dataset, "sample_index_within_subject"):
         dataset.sample_index_within_subject = dataset.sample_index_within_subject[:keep]
 
-    print(f"[EEG DATASET] max_samples={max_samples}: {original_len} → {len(dataset)}")
+    print(f"[EEG DATASET] max_samples={max_samples}: {original_len} -> {len(dataset)}")
     return dataset
 
 
-def make_train_dataset(args, tokenizer, accelerator):
+def make_train_dataset(args, accelerator=None):
     dataset = EEGImageDataset(
         dataset_name=args.dataset_name,
         subjects=args.train_subjects,
         subset_mode="train",
-        image_column=args.image_column,
         conditioning_image_column=args.conditioning_image_column,
-        caption_column=args.caption_column,
-        tokenizer=tokenizer,
         args=args,
-        root=args.data_root,
+        root=getattr(args, "data_root", None),
         accelerator=accelerator,
-        use_precomputed_latents=getattr(args, "use_precomputed_latents", False),
-        latents_dir=getattr(args, "latents_dir", None),
         use_precomputed_clip_embeds=getattr(args, "use_precomputed_clip_embeds", False),
         clip_embeds_dir=getattr(args, "clip_embeds_dir", None),
         val_ratio=getattr(args, "val_ratio", 0.1),
@@ -593,54 +470,42 @@ def make_train_dataset(args, tokenizer, accelerator):
     return _maybe_subsample_dataset(dataset, getattr(args, "max_train_samples", None))
 
 
-def make_val_dataset(args, tokenizer, accelerator):
-    dataset = EEGImageDataset(
+def make_val_dataset(args, accelerator=None):
+    return EEGImageDataset(
         dataset_name=args.dataset_name,
         subjects=args.val_subjects,
         subset_mode="val",
-        image_column=args.image_column,
         conditioning_image_column=args.conditioning_image_column,
-        caption_column=args.caption_column,
-        tokenizer=tokenizer,
         args=args,
-        root=args.data_root,
+        root=getattr(args, "data_root", None),
         accelerator=accelerator,
-        use_precomputed_latents=getattr(args, "use_precomputed_latents", False),
-        latents_dir=getattr(args, "latents_dir", None),
         use_precomputed_clip_embeds=getattr(args, "use_precomputed_clip_embeds", False),
         clip_embeds_dir=getattr(args, "clip_embeds_dir", None),
         val_ratio=getattr(args, "val_ratio", 0.1),
         split_seed=getattr(args, "split_seed", 42),
     )
-    return dataset
 
 
-def make_test_dataset(args, tokenizer, accelerator):
-    dataset = EEGImageDataset(
+def make_test_dataset(args, accelerator=None):
+    return EEGImageDataset(
         dataset_name=args.dataset_name,
         subjects=args.test_subjects,
         subset_mode="test",
-        image_column=args.image_column,
         conditioning_image_column=args.conditioning_image_column,
-        caption_column=args.caption_column,
-        tokenizer=tokenizer,
         args=args,
-        root=args.data_root,
+        root=getattr(args, "data_root", None),
         accelerator=accelerator,
-        use_precomputed_latents=getattr(args, "use_precomputed_latents", False),
-        latents_dir=getattr(args, "latents_dir", None),
         use_precomputed_clip_embeds=getattr(args, "use_precomputed_clip_embeds", False),
         clip_embeds_dir=getattr(args, "clip_embeds_dir", None),
         val_ratio=getattr(args, "val_ratio", 0.1),
         split_seed=getattr(args, "split_seed", 42),
     )
-    return dataset
 
 
 # ---------------------------------------------------------
 # Safe collate_fn
 # ---------------------------------------------------------
-def make_collate_fn(dataset_name):
+def make_collate_fn(dataset_name=None):
     def collate(batch):
         out = {}
         for key in batch[0]:
@@ -650,4 +515,5 @@ def make_collate_fn(dataset_name):
             else:
                 out[key] = values
         return out
+
     return collate
