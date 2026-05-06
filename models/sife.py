@@ -1,83 +1,159 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from .grl import GRL
 
 
 # ---------------------------------------------------------
-# Self-attention block (Transformer-like, lightweight)
+# ZEBRA-like transformer block
 # ---------------------------------------------------------
 class SelfAttentionBlock(nn.Module):
-    def __init__(self, dim: int, num_heads: int = 4, dropout: float = 0.1):
+    """
+    Lightweight pre-norm Transformer block.
+
+    Input / output:
+        x: (B, T, D)
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.1,
+    ):
         super().__init__()
+
+        hidden_dim = int(dim * mlp_ratio)
+
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
 
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 4),
+            nn.Linear(dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(dim * 4, dim),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
         )
 
-        self.dropout = nn.Dropout(dropout)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, D)
+        if x.ndim != 3:
+            raise ValueError(f"SelfAttentionBlock expects (B, T, D), got {tuple(x.shape)}")
+
         h = self.norm1(x)
         attn_out, _ = self.attn(h, h, h, need_weights=False)
-        x = x + self.dropout(attn_out)
+        x = x + attn_out
 
         h = self.norm2(x)
-        mlp_out = self.mlp(h)
-        x = x + self.dropout(mlp_out)
-
+        x = x + self.mlp(h)
         return x
 
 
 # ---------------------------------------------------------
-# Fi(.) module (EEG-irrelevant / subject-invariant extractor)
+# ZEBRA-like invariant extractor Fi(.)
 # ---------------------------------------------------------
 class FiModule(nn.Module):
+    """
+    Subject-invariant extractor.
+
+    More faithful to ZEBRA than the earlier lightweight version:
+      - stack of residual transformer blocks
+      - final LayerNorm
+      - no extra projection head at the end
+
+    Input:
+        x: (B, T, D)
+
+    Output:
+        E_i_seq: (B, T, D)
+    """
+
     def __init__(
         self,
         dim: int,
         seq_len: int,
-        num_layers: int = 2,
+        num_layers: int = 8,
         num_heads: int = 4,
+        mlp_ratio: float = 4.0,
         dropout: float = 0.1,
+        use_pos_embed: bool = False,
     ):
         super().__init__()
-        self.seq_len = seq_len
-        self.pos_embed = nn.Parameter(torch.zeros(1, seq_len, dim))
 
-        self.layers = nn.ModuleList([
-            SelfAttentionBlock(dim, num_heads=num_heads, dropout=dropout)
-            for _ in range(num_layers)
-        ])
+        self.dim = int(dim)
+        self.seq_len = int(seq_len)
+        self.use_pos_embed = bool(use_pos_embed)
+        self.use_gradient_checkpointing = False
 
-        self.proj = nn.Linear(dim, dim)
+        if self.use_pos_embed:
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.seq_len, self.dim))
+        else:
+            self.register_parameter("pos_embed", None)
+
+        self.layers = nn.ModuleList(
+            [
+                SelfAttentionBlock(
+                    dim=self.dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        self.norm = nn.LayerNorm(self.dim)
+
+    def set_gradient_checkpointing(self, enable: bool = True):
+        self.use_gradient_checkpointing = enable
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, D)
+        if x.ndim != 3:
+            raise ValueError(f"FiModule expects (B, T, D), got {tuple(x.shape)}")
         if x.size(1) != self.seq_len:
             raise ValueError(
                 f"FiModule expected seq_len={self.seq_len}, got T={x.size(1)}"
             )
+        if x.size(2) != self.dim:
+            raise ValueError(
+                f"FiModule expected dim={self.dim}, got D={x.size(2)}"
+            )
 
-        x = x + self.pos_embed
+        if self.pos_embed is not None:
+            x = x + self.pos_embed
 
         for layer in self.layers:
-            x = layer(x)
+            if self.training and self.use_gradient_checkpointing:
+                x = checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
 
-        e_i_seq = self.proj(x)
-        return e_i_seq
+        x = self.norm(x)
+        return x
 
 
 # ---------------------------------------------------------
-# Token-level MLP head for subject prediction
+# Token-level subject heads
 # ---------------------------------------------------------
 class SubjectHead(nn.Module):
+    """
+    Token-level subject classifier/discriminator.
+
+    Input:
+        x: (B, T, D)
+
+    Output:
+        logits: (B, K)
+    """
+
     def __init__(
         self,
         dim: int,
@@ -87,41 +163,55 @@ class SubjectHead(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
-        hidden_dim = hidden_dim or dim
 
-        self.seq_len = seq_len
+        hidden_dim = int(hidden_dim or dim)
+
+        self.dim = int(dim)
+        self.seq_len = int(seq_len)
+        self.num_classes = int(num_classes)
+
         self.net = nn.Sequential(
-            nn.Flatten(start_dim=1),                  # (B, T, D) -> (B, T*D)
-            nn.Linear(seq_len * dim, hidden_dim),
+            nn.Flatten(start_dim=1),  # (B, T, D) -> (B, T*D)
+            nn.Linear(self.seq_len * self.dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_classes),
+            nn.Linear(hidden_dim, self.num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 3:
-            raise ValueError(f"Expected x with shape (B, T, D), got {tuple(x.shape)}")
+            raise ValueError(f"SubjectHead expects (B, T, D), got {tuple(x.shape)}")
         if x.size(1) != self.seq_len:
             raise ValueError(
                 f"SubjectHead expected seq_len={self.seq_len}, got T={x.size(1)}"
             )
+        if x.size(2) != self.dim:
+            raise ValueError(
+                f"SubjectHead expected dim={self.dim}, got D={x.size(2)}"
+            )
+
         return self.net(x)
 
 
 # ---------------------------------------------------------
-# Main SIFE module
+# Main SIFE
 # ---------------------------------------------------------
 class SIFE(nn.Module):
     """
     Subject-Invariant Feature Extraction module.
 
+    ZEBRA-aligned logic:
+      - E_i_seq = Fi(E_seq)
+      - E_s_seq = E_seq - E_i_seq
+      - adversarial subject prediction on E_i_seq
+      - direct subject classification on E_s_seq
+
     Notes:
-    - `num_subjects` here should be the number of ACTIVE training subjects,
-      i.e. len(train_subjects), not the total number of subjects in the dataset.
-    - The caller is expected to remap subject ids to local class ids in [0, K-1].
+      - `num_subjects` should be the number of ACTIVE training subjects
+      - caller should remap original subject ids to [0, K-1]
     """
 
     def __init__(
@@ -129,46 +219,55 @@ class SIFE(nn.Module):
         dim: int = 128,
         seq_len: int = 77,
         num_subjects: int = 3,
-        fi_layers: int = 2,
+        fi_layers: int = 8,
         num_heads: int = 4,
         grl_lambda: float = 1.0,
         dropout: float = 0.1,
         classifier_hidden_dim: int = None,
+        fi_mlp_ratio: float = 4.0,
+        fi_use_pos_embed: bool = False,
     ):
         super().__init__()
 
         if num_subjects <= 1:
-            raise ValueError(f"SIFE requires at least 2 active subject classes, got {num_subjects}.")
+            raise ValueError(
+                f"SIFE requires at least 2 active subject classes, got {num_subjects}."
+            )
 
-        self.dim = dim
-        self.seq_len = seq_len
-        self.num_subjects = num_subjects
+        self.dim = int(dim)
+        self.seq_len = int(seq_len)
+        self.num_subjects = int(num_subjects)
 
         self.fi = FiModule(
-            dim=dim,
-            seq_len=seq_len,
-            num_layers=fi_layers,
-            num_heads=num_heads,
-            dropout=dropout,
+            dim=self.dim,
+            seq_len=self.seq_len,
+            num_layers=int(fi_layers),
+            num_heads=int(num_heads),
+            mlp_ratio=float(fi_mlp_ratio),
+            dropout=float(dropout),
+            use_pos_embed=bool(fi_use_pos_embed),
         )
 
-        self.grl = GRL(lambda_=grl_lambda)
+        self.grl = GRL(lambda_=float(grl_lambda))
 
         self.subject_discriminator = SubjectHead(
-            dim=dim,
-            seq_len=seq_len,
-            num_classes=num_subjects,
+            dim=self.dim,
+            seq_len=self.seq_len,
+            num_classes=self.num_subjects,
             hidden_dim=classifier_hidden_dim,
-            dropout=dropout,
+            dropout=float(dropout),
         )
 
         self.subject_classifier = SubjectHead(
-            dim=dim,
-            seq_len=seq_len,
-            num_classes=num_subjects,
+            dim=self.dim,
+            seq_len=self.seq_len,
+            num_classes=self.num_subjects,
             hidden_dim=classifier_hidden_dim,
-            dropout=dropout,
+            dropout=float(dropout),
         )
+
+    def set_gradient_checkpointing(self, enable: bool = True):
+        self.fi.set_gradient_checkpointing(enable)
 
     def forward(self, E_seq: torch.Tensor):
         """
@@ -179,33 +278,35 @@ class SIFE(nn.Module):
             dict with:
               - E_i_seq: (B, T, D)
               - E_s_seq: (B, T, D)
-              - E_i:     (B, D)   [solo per monitoring]
-              - E_s:     (B, D)   [solo per monitoring]
-              - pred_subject_i: (B, K) from token-level E_i_seq
-              - pred_subject_s: (B, K) from token-level E_s_seq
+              - E_i: (B, D) pooled monitor
+              - E_s: (B, D) pooled monitor
+              - pred_subject_i: (B, K)
+              - pred_subject_s: (B, K)
         """
         if E_seq.ndim != 3:
-            raise ValueError(f"Expected E_seq with shape (B, T, D), got {tuple(E_seq.shape)}")
-
+            raise ValueError(f"SIFE expects E_seq with shape (B, T, D), got {tuple(E_seq.shape)}")
         if E_seq.size(1) != self.seq_len:
             raise ValueError(
                 f"SIFE expected seq_len={self.seq_len}, got T={E_seq.size(1)}"
             )
+        if E_seq.size(2) != self.dim:
+            raise ValueError(
+                f"SIFE expected dim={self.dim}, got D={E_seq.size(2)}"
+            )
 
-        # Step 1: compute E_i
-        E_i_seq = self.fi(E_seq)  # (B, T, D)
+        # ZEBRA-like invariant branch
+        E_i_seq = self.fi(E_seq)
 
-        # Step 2: compute E_s
+        # residual specific branch
         E_s_seq = E_seq - E_i_seq
 
-        # solo per monitoring/debug
-        E_i = E_i_seq.mean(dim=1)  # (B, D)
-        E_s = E_s_seq.mean(dim=1)  # (B, D)
+        # pooled monitors only
+        E_i = E_i_seq.mean(dim=1)
+        E_s = E_s_seq.mean(dim=1)
 
-        # Step 4: adversarial + classification on token-level sequences
-        E_i_seq_grl = self.grl(E_i_seq)
-        pred_subject_i = self.subject_discriminator(E_i_seq_grl)  # (B, K)
-        pred_subject_s = self.subject_classifier(E_s_seq)         # (B, K)
+        # subject adversarial / direct heads
+        pred_subject_i = self.subject_discriminator(self.grl(E_i_seq))
+        pred_subject_s = self.subject_classifier(E_s_seq)
 
         return {
             "E_i_seq": E_i_seq,

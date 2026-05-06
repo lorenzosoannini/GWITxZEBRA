@@ -1,27 +1,63 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .grl import GRL
 
 
 # ---------------------------------------------------------
-# ADAPTERS
+# HELPERS
+# ---------------------------------------------------------
+def _normalize(x: torch.Tensor) -> torch.Tensor:
+    return F.normalize(x, dim=-1)
+
+
+def _flatten_sequence(x: torch.Tensor) -> torch.Tensor:
+    if x.ndim != 3:
+        raise ValueError(f"Expected 3D tensor (B, T, D), got shape {tuple(x.shape)}")
+    return x.reshape(x.shape[0], -1)
+
+
+def _maybe_resize_tokens(x: torch.Tensor, target_tokens: int) -> torch.Tensor:
+    """
+    Resize token length only if needed.
+
+    This is NOT part of the original ZEBRA design; it is only a compatibility
+    fallback for the user's EEG backbone if token count != target_tokens.
+    """
+    if x.ndim != 3:
+        raise ValueError(f"Expected 3D tensor (B, T, D), got shape {tuple(x.shape)}")
+
+    if x.shape[1] == target_tokens:
+        return x
+
+    x = x.transpose(1, 2)                  # (B, D, T_in)
+    x = F.adaptive_avg_pool1d(x, target_tokens)
+    x = x.transpose(1, 2)                  # (B, target_tokens, D)
+    return x
+
+
+# ---------------------------------------------------------
+# OPTIONAL SIMPLE ADAPTER
 # ---------------------------------------------------------
 class _SimpleSequenceAdapter(nn.Module):
     """
-    Simple adapter:
+    Simple fallback adapter:
       1. resize tokens only if needed
       2. token-wise MLP projection
       3. L2 normalization on feature dim
+
+    Kept only as an option. The preferred choice for ZEBRA-style experiments
+    is adapter_type="zebra_like".
     """
 
     def __init__(
         self,
         in_dim: int = 128,
         hidden_dim: int = 256,
-        out_dim: int = 768,
-        target_tokens: int = 49,
+        out_dim: int = 1664,
+        target_tokens: int = 256,
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -32,37 +68,26 @@ class _SimpleSequenceAdapter(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-
             nn.Linear(hidden_dim, out_dim),
         )
 
-    def _maybe_resize_tokens(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 3:
-            raise ValueError(f"Expected 3D tensor (B, T, D), got shape {tuple(x.shape)}")
-
-        if x.shape[1] == self.target_tokens:
-            return x
-
-        x = x.transpose(1, 2)  # (B, D, T_in)
-        x = F.adaptive_avg_pool1d(x, self.target_tokens)  # (B, D, target_tokens)
-        x = x.transpose(1, 2)  # (B, target_tokens, D)
-        return x
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self._maybe_resize_tokens(x)
+        x = _maybe_resize_tokens(x, self.target_tokens)
         y = self.token_mlp(x)
         y = F.normalize(y, dim=-1)
         return y
 
 
+# ---------------------------------------------------------
+# ZEBRA-LIKE PROJECTOR BLOCKS
+# ---------------------------------------------------------
 class _ZebraSemanticBottleneck(nn.Module):
     """
-    ZEBRA-like token mixing + channel projection.
+    Very close to ZEBRA's SemanticBottleneck.
 
     Input:
         x: (B, T, D_in)
@@ -80,71 +105,102 @@ class _ZebraSemanticBottleneck(nn.Module):
     ):
         super().__init__()
 
-        self.seq_mlp = nn.Sequential(
+        self.use_gradient_checkpointing = False
+
+        self.mlp = nn.Sequential(
             nn.LayerNorm(seq_dim),
             nn.Linear(seq_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, seq_dim),
         )
 
-        self.channel_proj = nn.Sequential(
+        self.project = nn.Sequential(
             nn.LayerNorm(in_dim),
             nn.Linear(in_dim, out_dim),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.transpose(1, 2)        # (B, D_in, T)
-        x = self.seq_mlp(x)          # (B, D_in, T)
-        x = x.transpose(1, 2)        # (B, T, D_in)
-        x = self.channel_proj(x)     # (B, T, D_out)
+    def set_gradient_checkpointing(self, enable: bool = True):
+        self.use_gradient_checkpointing = bool(enable)
+
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.transpose(1, 2)      # (B, D_in, T)
+        x = self.mlp(x)            # (B, D_in, T)
+        x = x.transpose(1, 2)      # (B, T, D_in)
+        x = self.project(x)        # (B, T, D_out)
         return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError(f"_ZebraSemanticBottleneck expects (B, T, D), got {tuple(x.shape)}")
+
+        if self.training and self.use_gradient_checkpointing:
+            return checkpoint(self._forward_impl, x, use_reentrant=False)
+
+        return self._forward_impl(x)
 
 
 class _ZebraChannelWiseAttention(nn.Module):
     """
-    ZEBRA-like attention refinement preserving token length.
+    Closer replica of ZEBRA's ChannelWiseAttention.
+
+    Important:
+    this is intentionally NOT a standard token self-attention implementation.
+    It follows the algebra used in the original ZEBRA code as closely as possible.
     """
 
-    def __init__(self, dim: int, num_heads: int = 1):
+    def __init__(self, in_dim: int, num_heads: int = 1):
         super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
 
-        self.query_proj = nn.Linear(dim, dim)
-        self.key_proj = nn.Linear(dim, dim)
-        self.value_proj = nn.Linear(dim, dim)
-        self.out_proj = nn.Linear(dim, dim)
+        if in_dim % num_heads != 0:
+            raise ValueError(f"in_dim={in_dim} must be divisible by num_heads={num_heads}")
+
+        self.use_gradient_checkpointing = False
+
+        self.query_proj = nn.Linear(in_dim, in_dim)
+        self.key_proj = nn.Linear(in_dim, in_dim)
+        self.value_proj = nn.Linear(in_dim, in_dim)
+        self.out_proj = nn.Linear(in_dim, in_dim)
 
         self.num_heads = num_heads
-        self.head_dim = dim // num_heads
+        self.head_dim = in_dim // num_heads
+
+    def set_gradient_checkpointing(self, enable: bool = True):
+        self.use_gradient_checkpointing = bool(enable)
+
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
+        b, n, c = x.shape
+
+        q = self.query_proj(x)   # [B, N, C]
+        k = self.key_proj(x)     # [B, N, C]
+        v = self.value_proj(x)   # [B, N, C]
+
+        # This mirrors the original ZEBRA code path.
+        scores = (q.transpose(-2, -1) @ k) / (self.head_dim ** 0.5)   # [B, C, C]
+        attn = torch.softmax(scores, dim=-1)                          # [B, C, C]
+
+        attn_out = attn @ v.transpose(-2, -1)                         # [B, C, N]
+        attn_out = attn_out.transpose(-2, -1)                         # [B, N, C]
+
+        out = self.out_proj(attn_out)
+        return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, t, d = x.shape
-        h = self.num_heads
-        dh = self.head_dim
+        if x.ndim != 3:
+            raise ValueError(f"_ZebraChannelWiseAttention expects (B, N, C), got {tuple(x.shape)}")
 
-        q = self.query_proj(x).view(b, t, h, dh).transpose(1, 2)
-        k = self.key_proj(x).view(b, t, h, dh).transpose(1, 2)
-        v = self.value_proj(x).view(b, t, h, dh).transpose(1, 2)
+        if self.training and self.use_gradient_checkpointing:
+            return checkpoint(self._forward_impl, x, use_reentrant=False)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / (dh ** 0.5)
-        attn = torch.softmax(scores, dim=-1)
-
-        out = torch.matmul(attn, v)
-        out = out.transpose(1, 2).contiguous().view(b, t, d)
-        out = self.out_proj(out)
-        return out
+        return self._forward_impl(x)
 
 
 class _ZebraLikeSequenceAdapter(nn.Module):
     """
-    ZEBRA-like adapter.
-
-    Behavior:
+    ZEBRA-like projector:
       1. resize tokens only if needed
       2. token mixing on sequence dimension
       3. channel projection
-      4. attention refinement
+      4. channel-wise attention refinement
       5. L2 normalization
     """
 
@@ -152,9 +208,9 @@ class _ZebraLikeSequenceAdapter(nn.Module):
         self,
         in_dim: int = 128,
         hidden_dim: int = 256,
-        out_dim: int = 768,
-        target_tokens: int = 49,
-        dropout: float = 0.1,
+        out_dim: int = 1664,
+        target_tokens: int = 256,
+        dropout: float = 0.1,   # kept for interface compatibility; unused here
         num_heads: int = 1,
     ):
         super().__init__()
@@ -169,27 +225,19 @@ class _ZebraLikeSequenceAdapter(nn.Module):
             hidden_dim=seq_hidden_dim,
         )
 
-        self.attn = _ZebraChannelWiseAttention(
-            dim=out_dim,
+        self.broadcaster = _ZebraChannelWiseAttention(
+            in_dim=out_dim,
             num_heads=num_heads,
         )
 
-    def _maybe_resize_tokens(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 3:
-            raise ValueError(f"Expected 3D tensor (B, T, D), got shape {tuple(x.shape)}")
-
-        if x.shape[1] == self.target_tokens:
-            return x
-
-        x = x.transpose(1, 2)
-        x = F.adaptive_avg_pool1d(x, self.target_tokens)
-        x = x.transpose(1, 2)
-        return x
+    def set_gradient_checkpointing(self, enable: bool = True):
+        self.bottleneck.set_gradient_checkpointing(enable)
+        self.broadcaster.set_gradient_checkpointing(enable)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self._maybe_resize_tokens(x)
+        x = _maybe_resize_tokens(x, self.target_tokens)
         x = self.bottleneck(x)
-        x = self.attn(x)
+        x = self.broadcaster(x)
         x = F.normalize(x, dim=-1)
         return x
 
@@ -229,7 +277,7 @@ def _build_sequence_adapter(
 # ---------------------------------------------------------
 class ImageClassifier(nn.Module):
     """
-    Single-label image-class semantic classifier over image classes.
+    ZEBRA-like image classifier.
 
     Input:
         x: (B, T, D)
@@ -238,7 +286,7 @@ class ImageClassifier(nn.Module):
         logits: (B, num_classes)
     """
 
-    def __init__(self, embed_dim: int = 768, num_classes: int = 40):
+    def __init__(self, embed_dim: int = 1664, num_classes: int = 40):
         super().__init__()
         self.attn_proj = nn.Linear(embed_dim, 1)
         self.classifier = nn.Linear(embed_dim, num_classes)
@@ -256,14 +304,13 @@ class ImageClassifier(nn.Module):
 
 class ImageDiscriminator(nn.Module):
     """
-    Single-label adversarial image-class semantic discriminator over image classes.
-
-    GRL is applied here, as in the ZEBRA code.
+    ZEBRA-like adversarial image discriminator.
+    GRL is applied exactly before the same attention-pool classifier head.
     """
 
     def __init__(
         self,
-        embed_dim: int = 768,
+        embed_dim: int = 1664,
         num_classes: int = 40,
         grl_lambda: float = 1.0,
     ):
@@ -286,22 +333,24 @@ class ImageDiscriminator(nn.Module):
 
 class AnchorTextProjector(nn.Module):
     """
-    ZEBRA-like CLIP text projector from F:
-      mean pooling over tokens
-      linear projection to text embedding space
-      L2 normalization
+    Close counterpart of ZEBRA's CLIPProj:
+
+        x = mean over tokens
+        x = linear projection
+
+    Normalization is applied at the end because your losses expect normalized text anchors.
     """
 
-    def __init__(self, in_dim: int = 768, out_dim: int = 512):
+    def __init__(self, in_dim: int = 1664, out_dim: int = 1280):
         super().__init__()
-        self.proj = nn.Linear(in_dim, out_dim)
+        self.proj = nn.Parameter(torch.randn(in_dim, out_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 3:
             raise ValueError(f"AnchorTextProjector expects (B, T, D), got {tuple(x.shape)}")
 
-        x = x.mean(dim=1)
-        x = self.proj(x)
+        x = torch.mean(x, dim=1)   # (B, in_dim)
+        x = x @ self.proj          # (B, out_dim)
         x = F.normalize(x, dim=-1)
         return x
 
@@ -323,20 +372,20 @@ class SSFEProjector(nn.Module):
         - adversarial image dis on F_i
         - anchor visual alignment directly on F
         - anchor image cls on F using the SAME image classifier
-        - anchor text alignment on F through a simple CLIP-like projector
+        - anchor text alignment on F through a ZEBRA-like CLIPProj head
     """
 
     def __init__(
         self,
         in_dim: int = 128,
         hidden_dim: int = 256,
-        out_dim: int = 768,
-        target_tokens: int = 49,
+        out_dim: int = 1664,
+        target_tokens: int = 256,
         adapter_type: str = "zebra_like",
         dropout: float = 0.1,
         grl_lambda: float = 1.0,
         num_image_classes: int = 40,
-        text_out_dim: int = 512,
+        text_out_dim: int = 1280,
     ):
         super().__init__()
 
@@ -363,7 +412,7 @@ class SSFEProjector(nn.Module):
             dropout=dropout,
         )
 
-        # Shared image classifier used both on F_s and F, as in ZEBRA
+        # Shared classifier, as in ZEBRA logic
         self.image_classifier = ImageClassifier(
             embed_dim=out_dim,
             num_classes=num_image_classes,
@@ -375,11 +424,17 @@ class SSFEProjector(nn.Module):
             grl_lambda=grl_lambda,
         )
 
-        # Simple CLIP-like text head on F
         self.anchor_text_projector = AnchorTextProjector(
             in_dim=out_dim,
             out_dim=text_out_dim,
         )
+
+    def set_gradient_checkpointing(self, enable: bool = True):
+        if hasattr(self.general_projector, "set_gradient_checkpointing"):
+            self.general_projector.set_gradient_checkpointing(enable)
+        if hasattr(self.semantic_projector, "set_gradient_checkpointing"):
+            self.semantic_projector.set_gradient_checkpointing(enable)
+
 
     def forward(
         self,
@@ -401,18 +456,17 @@ class SSFEProjector(nn.Module):
         # F_i = F - F_s
         F_i = F_general - F_s
 
-        # Semantic heads
+        # ZEBRA-like heads
         pred_image_cls = self.image_classifier(F_s)
         pred_image_dis = self.image_discriminator(F_i)
 
-        # Anchor heads on F
-        # Visual anchor is applied directly on F, as in ZEBRA
+        # anchor visual is directly F
         F_anchor_visual = F_general
 
-        # Reuse same classifier on F
+        # reuse same image classifier on F
         pred_image_cls_anchor = self.image_classifier(F_general)
 
-        # Simple text projector on F
+        # text anchor from F
         anchor_text_embed = self.anchor_text_projector(F_general)
 
         return {
@@ -425,19 +479,6 @@ class SSFEProjector(nn.Module):
             "pred_image_cls_anchor": pred_image_cls_anchor,
             "anchor_text_embed": anchor_text_embed,
         }
-
-
-# ---------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------
-def _normalize(x: torch.Tensor) -> torch.Tensor:
-    return F.normalize(x, dim=-1)
-
-
-def _flatten_sequence(x: torch.Tensor) -> torch.Tensor:
-    if x.ndim != 3:
-        raise ValueError(f"Expected 3D tensor (B, T, D), got shape {tuple(x.shape)}")
-    return x.reshape(x.shape[0], -1)
 
 
 # ---------------------------------------------------------

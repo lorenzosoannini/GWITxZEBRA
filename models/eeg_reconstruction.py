@@ -1,5 +1,5 @@
-import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 
 class ResidualBlock1D(nn.Module):
@@ -19,38 +19,33 @@ class ResidualBlock1D(nn.Module):
 
 
 class EEGReconstructionDecoder(nn.Module):
-    """
-    Input:
-        E_seq: (B, T, D)  → (B, 440, 128)
-
-    Output:
-        EEG reconstructed: (B, C, T) → (B, 128, 440)
-    """
-
     def __init__(
         self,
         in_dim=128,
         hidden_dim=256,
         out_channels=128,
         num_res_blocks=3,
+        use_gradient_checkpointing=False,
     ):
         super().__init__()
 
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+
         self.input_proj = nn.Conv1d(in_dim, hidden_dim, kernel_size=1)
-
-        self.res_blocks = nn.Sequential(
-            *[ResidualBlock1D(hidden_dim) for _ in range(num_res_blocks)]
+        self.res_blocks = nn.ModuleList(
+            [ResidualBlock1D(hidden_dim) for _ in range(num_res_blocks)]
         )
-
         self.output_proj = nn.Conv1d(hidden_dim, out_channels, kernel_size=1)
 
     def forward(self, E_seq):
-        # E_seq: (B, T, D) → (B, D, T)
         x = E_seq.permute(0, 2, 1)
-
         x = self.input_proj(x)
-        x = self.res_blocks(x)
-        x = self.output_proj(x)
 
-        # (B, C, T)
+        for block in self.res_blocks:
+            if self.training and self.use_gradient_checkpointing:
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
+
+        x = self.output_proj(x)
         return x

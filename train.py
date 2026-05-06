@@ -6,10 +6,8 @@ import logging
 import os
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn.functional as F
-import torch.utils.checkpoint
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
@@ -17,8 +15,6 @@ from tqdm.auto import tqdm
 from transformers import (
     AutoTokenizer,
     PretrainedConfig,
-    CLIPTokenizer,
-    CLIPTextModelWithProjection,
 )
 
 from diffusers import (
@@ -243,11 +239,15 @@ def run_validation_metrics(
     ssfe_projector,
     diffusion_prior,
     subject_to_local,
-    anchor_clip_tokenizer,
-    anchor_clip_text_model,
     args,
     accelerator,
 ):
+    prev_eeg_training = eeg_backbone.training
+    prev_sife_training = sife.training if sife is not None else None
+    prev_recon_training = recon_decoder.training if recon_decoder is not None else None
+    prev_ssfe_training = ssfe_projector.training if ssfe_projector is not None else None
+    prev_prior_training = diffusion_prior.training if diffusion_prior is not None else None
+
     eeg_backbone.eval()
     if sife is not None:
         sife.eval()
@@ -258,36 +258,33 @@ def run_validation_metrics(
     if diffusion_prior is not None:
         diffusion_prior.eval()
 
-    total = 0
+    device = accelerator.device
 
-    # --- accumulators ---
-    # SIFE
-    loss_subject_inv_tot = 0.0
-    loss_subject_spec_tot = 0.0
-    acc_subject_inv_tot = 0.0
-    acc_subject_spec_tot = 0.0
-    Ei_norm_tot = 0.0
-    Es_norm_tot = 0.0
-    Ei_Es_ratio_tot = 0.0
-    Ei_Es_cos_tot = 0.0
+    total = torch.tensor(0.0, device=device)
 
-    # Recon
-    loss_recon_tot = 0.0
+    # --- accumulators as tensors ---
+    loss_subject_inv_tot = torch.tensor(0.0, device=device)
+    loss_subject_spec_tot = torch.tensor(0.0, device=device)
+    acc_subject_inv_tot = torch.tensor(0.0, device=device)
+    acc_subject_spec_tot = torch.tensor(0.0, device=device)
+    Ei_norm_tot = torch.tensor(0.0, device=device)
+    Es_norm_tot = torch.tensor(0.0, device=device)
+    Ei_Es_ratio_tot = torch.tensor(0.0, device=device)
+    Ei_Es_cos_tot = torch.tensor(0.0, device=device)
 
-    # SSFE semantic branch
-    loss_image_cls_tot = 0.0
-    loss_image_dis_tot = 0.0
-    acc_image_cls_tot = 0.0
-    acc_image_dis_tot = 0.0
+    loss_recon_tot = torch.tensor(0.0, device=device)
 
-    # Anchor branch
-    loss_anchor_cls_tot = 0.0
-    loss_anchor_visual_tot = 0.0
-    loss_anchor_text_tot = 0.0
-    top1_anchor_tot = 0.0
+    loss_image_cls_tot = torch.tensor(0.0, device=device)
+    loss_image_dis_tot = torch.tensor(0.0, device=device)
+    acc_image_cls_tot = torch.tensor(0.0, device=device)
+    acc_image_dis_tot = torch.tensor(0.0, device=device)
 
-    # Prior
-    loss_prior_tot = 0.0
+    loss_anchor_cls_tot = torch.tensor(0.0, device=device)
+    loss_anchor_visual_tot = torch.tensor(0.0, device=device)
+    loss_anchor_text_tot = torch.tensor(0.0, device=device)
+    top1_anchor_tot = torch.tensor(0.0, device=device)
+
+    loss_prior_tot = torch.tensor(0.0, device=device)
 
     with torch.no_grad():
         for batch in val_dataloader:
@@ -301,20 +298,15 @@ def run_validation_metrics(
             )
 
             bsz = eeg_cond.shape[0]
-            total += bsz
+            bsz_t = total.new_tensor(float(bsz))
+            total += bsz_t
 
-            # ---------------------------------------------------------
-            # EEG backbone
-            # ---------------------------------------------------------
             eeg_feats = eeg_backbone(eeg_cond.float())
             E_seq = eeg_feats["sequence"]
 
             E_i_seq = None
             F_s = None
 
-            # ---------------------------------------------------------
-            # SIFE
-            # ---------------------------------------------------------
             if sife is not None:
                 sife_out = sife(E_seq)
 
@@ -340,18 +332,15 @@ def run_validation_metrics(
                 Ei_Es_ratio = Ei_norm / (Es_norm + 1e-8)
                 Ei_Es_cos = F.cosine_similarity(E_i, E_s, dim=-1).mean()
 
-                loss_subject_inv_tot += loss_subject_inv.item() * bsz
-                loss_subject_spec_tot += loss_subject_spec.item() * bsz
-                acc_subject_inv_tot += acc_subject_inv.item() * bsz
-                acc_subject_spec_tot += acc_subject_spec.item() * bsz
-                Ei_norm_tot += Ei_norm.item() * bsz
-                Es_norm_tot += Es_norm.item() * bsz
-                Ei_Es_ratio_tot += Ei_Es_ratio.item() * bsz
-                Ei_Es_cos_tot += Ei_Es_cos.item() * bsz
+                loss_subject_inv_tot += loss_subject_inv * bsz_t
+                loss_subject_spec_tot += loss_subject_spec * bsz_t
+                acc_subject_inv_tot += acc_subject_inv * bsz_t
+                acc_subject_spec_tot += acc_subject_spec * bsz_t
+                Ei_norm_tot += Ei_norm * bsz_t
+                Es_norm_tot += Es_norm * bsz_t
+                Ei_Es_ratio_tot += Ei_Es_ratio * bsz_t
+                Ei_Es_cos_tot += Ei_Es_cos * bsz_t
 
-            # ---------------------------------------------------------
-            # EEG reconstruction
-            # ---------------------------------------------------------
             if recon_decoder is not None:
                 eeg_recon = recon_decoder(E_seq.float())
                 eeg_target = eeg_cond.float()
@@ -365,18 +354,22 @@ def run_validation_metrics(
                 else:
                     raise ValueError(f"Unsupported recon_loss_type: {args.recon_loss_type}")
 
-                loss_recon_tot += loss_recon.item() * bsz
+                loss_recon_tot += loss_recon * bsz_t
 
-            # ---------------------------------------------------------
-            # SSFE + anchors
-            # ---------------------------------------------------------
             if ssfe_projector is not None:
                 if E_i_seq is None:
                     raise RuntimeError("Validation SSFE requires E_i_seq from SIFE.")
 
+                ssfe_param_dtype = next(ssfe_projector.parameters()).dtype
+                prior_param_dtype = (
+                    next(diffusion_prior.parameters()).dtype
+                    if diffusion_prior is not None
+                    else ssfe_param_dtype
+                )
+
                 ssfe_out = ssfe_projector(
-                    E_i=E_i_seq.float(),
-                    E=E_seq.float(),
+                    E_i=E_i_seq.to(dtype=ssfe_param_dtype),
+                    E=E_seq.to(dtype=ssfe_param_dtype),
                 )
 
                 F_s = ssfe_out["F_s"]
@@ -386,136 +379,158 @@ def run_validation_metrics(
                 pred_image_dis = ssfe_out["pred_image_dis"]
                 pred_image_cls_anchor = ssfe_out["pred_image_cls_anchor"]
 
-                # semantic losses
-                loss_image_cls = F.cross_entropy(pred_image_cls, image_labels)
-                loss_image_dis = F.cross_entropy(pred_image_dis, image_labels)
+                loss_image_cls = F.cross_entropy(pred_image_cls.float(), image_labels)
+                loss_image_dis = F.cross_entropy(pred_image_dis.float(), image_labels)
 
                 acc_image_cls = (pred_image_cls.argmax(dim=-1) == image_labels).float().mean()
                 acc_image_dis = (pred_image_dis.argmax(dim=-1) == image_labels).float().mean()
 
-                loss_image_cls_tot += loss_image_cls.item() * bsz
-                loss_image_dis_tot += loss_image_dis.item() * bsz
-                acc_image_cls_tot += acc_image_cls.item() * bsz
-                acc_image_dis_tot += acc_image_dis.item() * bsz
+                loss_image_cls_tot += loss_image_cls * bsz_t
+                loss_image_dis_tot += loss_image_dis * bsz_t
+                acc_image_cls_tot += acc_image_cls * bsz_t
+                acc_image_dis_tot += acc_image_dis * bsz_t
 
-                # anchor cls
-                loss_anchor_cls = F.cross_entropy(pred_image_cls_anchor, image_labels)
-                loss_anchor_cls_tot += loss_anchor_cls.item() * bsz
+                loss_anchor_cls = F.cross_entropy(pred_image_cls_anchor.float(), image_labels)
+                loss_anchor_cls_tot += loss_anchor_cls * bsz_t
 
-                # clip target
-                clip_target = batch["clip_img_embeds"].to(
-                    accelerator.device,
-                    dtype=torch.float32,
-                )
-
-                # anchor visual
-                loss_anchor_visual = sequence_info_nce_loss(
-                    F_anchor_visual.float(),
-                    clip_target.float(),
-                    temperature=args.anchor_visual_temperature,
-                )
-                loss_anchor_visual_tot += loss_anchor_visual.item() * bsz
-
-                # retrieval top1
-                pred_flat = F.normalize(
-                    F_anchor_visual.float().reshape(F_anchor_visual.shape[0], -1),
-                    dim=-1,
-                )
-                tgt_flat = F.normalize(
-                    clip_target.float().reshape(clip_target.shape[0], -1),
-                    dim=-1,
-                )
-
-                sim = pred_flat @ tgt_flat.t()
-                top1 = (
-                    sim.argmax(dim=1)
-                    == torch.arange(sim.shape[0], device=sim.device)
-                ).float().mean()
-
-                top1_anchor_tot += top1.item() * bsz
-
-                # anchor text
-                if args.lambda_anchor_text > 0.0:
-                    if anchor_clip_tokenizer is None or anchor_clip_text_model is None:
-                        raise RuntimeError(
-                            "Validation anchor text loss requested but CLIP text tokenizer/model is missing."
-                        )
-
-                    clip_text_inputs = anchor_clip_tokenizer(
-                        batch["caption_text"],
-                        padding="max_length",
-                        truncation=True,
-                        max_length=anchor_clip_tokenizer.model_max_length,
-                        return_tensors="pt",
+                if args.lambda_anchor_visual > 0.0:
+                    clip_target_ssfe = batch["clip_img_embeds"].to(
+                        accelerator.device,
+                        dtype=ssfe_param_dtype,
                     )
 
-                    clip_text_inputs = {
-                        "input_ids": clip_text_inputs["input_ids"].to(accelerator.device),
-                        "attention_mask": clip_text_inputs["attention_mask"].to(accelerator.device),
-                    }
+                    loss_anchor_visual = sequence_info_nce_loss(
+                        F_anchor_visual.float(),
+                        clip_target_ssfe.float(),
+                        temperature=args.anchor_visual_temperature,
+                    )
 
-                    text_out = anchor_clip_text_model(**clip_text_inputs, return_dict=True)
-                    text_target = F.normalize(text_out.text_embeds.float(), dim=-1)
+                    loss_anchor_visual_tot += loss_anchor_visual * bsz_t
+
+                    pred_flat = F.normalize(
+                        F_anchor_visual.float().reshape(F_anchor_visual.shape[0], -1),
+                        dim=-1,
+                    )
+                    tgt_flat = F.normalize(
+                        clip_target_ssfe.float().reshape(clip_target_ssfe.shape[0], -1),
+                        dim=-1,
+                    )
+
+                    sim = pred_flat @ tgt_flat.t()
+                    top1 = (
+                        sim.argmax(dim=1)
+                        == torch.arange(sim.shape[0], device=sim.device)
+                    ).float().mean()
+
+                    top1_anchor_tot += top1 * bsz_t
+
+                if args.lambda_anchor_text > 0.0:
+                    text_target = batch["clip_text_embeds"].to(
+                        accelerator.device,
+                        dtype=ssfe_param_dtype,
+                    )
 
                     loss_anchor_text = info_nce_loss(
                         ssfe_out["anchor_text_embed"].float(),
-                        text_target,
+                        text_target.float(),
                         temperature=args.anchor_text_temperature,
                     )
 
-                    loss_anchor_text_tot += loss_anchor_text.item() * bsz
+                    loss_anchor_text_tot += loss_anchor_text * bsz_t
 
-                # prior
                 if diffusion_prior is not None:
-                    prior_loss, _ = diffusion_prior(
-                        text_embed=F_s.float(),
-                        image_embed=clip_target.float(),
+                    clip_target_prior = batch["clip_img_embeds"].to(
+                        accelerator.device,
+                        dtype=prior_param_dtype,
                     )
-                    loss_prior_tot += prior_loss.item() * bsz
 
-    if total == 0:
+                    prior_loss, _ = diffusion_prior(
+                        text_embed=F_s.to(dtype=prior_param_dtype),
+                        image_embed=clip_target_prior,
+                    )
+                    loss_prior_tot += prior_loss * bsz_t
+
+    gathered = accelerator.gather_for_metrics(
+        torch.stack([
+            total,
+            loss_subject_inv_tot,
+            loss_subject_spec_tot,
+            acc_subject_inv_tot,
+            acc_subject_spec_tot,
+            Ei_norm_tot,
+            Es_norm_tot,
+            Ei_Es_ratio_tot,
+            Ei_Es_cos_tot,
+            loss_recon_tot,
+            loss_image_cls_tot,
+            loss_image_dis_tot,
+            acc_image_cls_tot,
+            acc_image_dis_tot,
+            loss_anchor_cls_tot,
+            loss_anchor_visual_tot,
+            loss_anchor_text_tot,
+            top1_anchor_tot,
+            loss_prior_tot,
+        ]).unsqueeze(0)
+    )
+
+    summed = gathered.sum(dim=0).view(-1)
+    total_global = summed[0]
+
+    if total_global.item() == 0:
         raise RuntimeError("Validation dataloader is empty: cannot compute validation metrics.")
 
     metrics = {
-        # SIFE
-        "val/loss_subject_inv": loss_subject_inv_tot / total,
-        "val/loss_subject_spec": loss_subject_spec_tot / total,
-        "val/acc_subject_inv": acc_subject_inv_tot / total,
-        "val/acc_subject_spec": acc_subject_spec_tot / total,
-        "val/E_i_norm": Ei_norm_tot / total,
-        "val/E_s_norm": Es_norm_tot / total,
-        "val/Ei_Es_norm_ratio": Ei_Es_ratio_tot / total,
-        "val/Ei_Es_cos": Ei_Es_cos_tot / total,
-
-        # Recon
-        "val/loss_recon": loss_recon_tot / total,
-
-        # SSFE semantic
-        "val/loss_image_cls": loss_image_cls_tot / total,
-        "val/loss_image_dis": loss_image_dis_tot / total,
-        "val/acc_image_cls": acc_image_cls_tot / total,
-        "val/acc_image_dis": acc_image_dis_tot / total,
-
-        # Anchor
-        "val/anchor_cls_loss": loss_anchor_cls_tot / total,
-        "val/anchor_visual_loss": loss_anchor_visual_tot / total,
-        "val/anchor_top1": top1_anchor_tot / total,
-        "val/loss_anchor_text": loss_anchor_text_tot / total,
+        "val/loss_subject_inv": (summed[1] / total_global).item(),
+        "val/loss_subject_spec": (summed[2] / total_global).item(),
+        "val/acc_subject_inv": (summed[3] / total_global).item(),
+        "val/acc_subject_spec": (summed[4] / total_global).item(),
+        "val/E_i_norm": (summed[5] / total_global).item(),
+        "val/E_s_norm": (summed[6] / total_global).item(),
+        "val/Ei_Es_norm_ratio": (summed[7] / total_global).item(),
+        "val/Ei_Es_cos": (summed[8] / total_global).item(),
+        "val/loss_recon": (summed[9] / total_global).item(),
+        "val/loss_image_cls": (summed[10] / total_global).item(),
+        "val/loss_image_dis": (summed[11] / total_global).item(),
+        "val/acc_image_cls": (summed[12] / total_global).item(),
+        "val/acc_image_dis": (summed[13] / total_global).item(),
+        "val/anchor_cls_loss": (summed[14] / total_global).item(),
+        "val/anchor_visual_loss": (summed[15] / total_global).item(),
+        "val/loss_anchor_text": (summed[16] / total_global).item(),
+        "val/anchor_top1": (summed[17] / total_global).item(),
     }
 
     if diffusion_prior is not None:
-        metrics["val/prior_loss"] = loss_prior_tot / total
+        metrics["val/prior_loss"] = (summed[18] / total_global).item()
 
-    # restore train mode
-    eeg_backbone.train()
+    if prev_eeg_training:
+        eeg_backbone.train()
+    else:
+        eeg_backbone.eval()
+
     if sife is not None:
-        sife.train()
+        if prev_sife_training:
+            sife.train()
+        else:
+            sife.eval()
+
     if recon_decoder is not None:
-        recon_decoder.train()
+        if prev_recon_training:
+            recon_decoder.train()
+        else:
+            recon_decoder.eval()
+
     if ssfe_projector is not None:
-        ssfe_projector.train()
+        if prev_ssfe_training:
+            ssfe_projector.train()
+        else:
+            ssfe_projector.eval()
+
     if diffusion_prior is not None:
-        diffusion_prior.train()
+        if prev_prior_training:
+            diffusion_prior.train()
+        else:
+            diffusion_prior.eval()
 
     return metrics
 
@@ -629,11 +644,16 @@ def parse_args(input_args=None):
 
     # SIFE
     parser.add_argument("--use_sife", action="store_true")
-    parser.add_argument("--sife_num_layers", type=int, default=2)
+    parser.add_argument("--sife_num_layers", type=int, default=8)
     parser.add_argument("--sife_num_heads", type=int, default=4)
     parser.add_argument("--grl_lambda_sife", type=float, default=1.0)
     parser.add_argument("--lambda_subject_inv", type=float, default=1.0)
     parser.add_argument("--lambda_subject_spec", type=float, default=1.0)
+    parser.add_argument(
+        "--gradient_checkpointing_sife",
+        action="store_true",
+        help="Enable gradient checkpointing inside SIFE/FiModule to reduce VRAM usage.",
+    )
 
     # EEG reconstruction
     parser.add_argument("--use_eeg_reconstruction", action="store_true")
@@ -645,8 +665,8 @@ def parse_args(input_args=None):
     # SSFE
     parser.add_argument("--use_ssfe", action="store_true")
     parser.add_argument("--ssfe_hidden_dim", type=int, default=256)
-    parser.add_argument("--ssfe_out_dim", type=int, default=768)
-    parser.add_argument("--ssfe_target_tokens", type=int, default=49)
+    parser.add_argument("--ssfe_out_dim", type=int, default=1664)
+    parser.add_argument("--ssfe_target_tokens", type=int, default=256)
     parser.add_argument(
         "--ssfe_adapter_type",
         type=str,
@@ -658,20 +678,15 @@ def parse_args(input_args=None):
     parser.add_argument("--lambda_ssfe", type=float, default=1.0)
     parser.add_argument("--lambda_image_cls", type=float, default=1.0)
     parser.add_argument("--lambda_image_dis", type=float, default=1.0)
+    parser.add_argument("--gradient_checkpointing_ssfe", action="store_true")
 
     # ANCHOR F
-    parser.add_argument("--lambda_anchor_cls", type=float, default=0.5)
-    parser.add_argument("--lambda_anchor_visual", type=float, default=0.5)
-    parser.add_argument("--lambda_anchor_text", type=float, default=0.25)
+    parser.add_argument("--lambda_anchor_cls", type=float, default=0.0)
+    parser.add_argument("--lambda_anchor_visual", type=float, default=0.0)
+    parser.add_argument("--lambda_anchor_text", type=float, default=0.0)
 
     parser.add_argument("--anchor_visual_temperature", type=float, default=0.07)
     parser.add_argument("--anchor_text_temperature", type=float, default=0.07)
-
-    parser.add_argument(
-        "--anchor_clip_model_name_or_path",
-        type=str,
-        default="openai/clip-vit-base-patch32",
-    )
 
     # PRIOR
     parser.add_argument("--use_prior", action="store_true")
@@ -681,9 +696,14 @@ def parse_args(input_args=None):
     parser.add_argument("--prior_dim", type=int, default=None,
                         help="If None, inferred from --ssfe_out_dim.")
     parser.add_argument("--prior_depth", type=int, default=6)
-    parser.add_argument("--prior_heads", type=int, default=8)
+    parser.add_argument("--prior_heads", type=int, default=32)
     parser.add_argument("--prior_timesteps", type=int, default=100)
     parser.add_argument("--prior_cond_drop_prob", type=float, default=0.2)
+    parser.add_argument(
+        "--gradient_checkpointing_prior",
+        action="store_true",
+        help="Enable gradient checkpointing inside PriorNetwork transformer blocks.",
+    )
 
     # Training policy
     parser.add_argument("--freeze_controlnet", action="store_true")
@@ -692,6 +712,18 @@ def parse_args(input_args=None):
         action="store_true",
         help="Train only EEG backbone + optional SIFE/SSFE/recon, skipping GWIT diffusion branch entirely.",
     )
+    parser.add_argument(
+        "--training_stage",
+        type=str,
+        default="full",
+        choices=["full", "stage1", "stage2", "stage3"],
+        help="Training stage for staged training.",
+    )
+
+    parser.add_argument("--load_sife_path", type=str, default=None)
+    parser.add_argument("--load_recon_path", type=str, default=None)
+    parser.add_argument("--load_ssfe_path", type=str, default=None)
+    parser.add_argument("--load_prior_path", type=str, default=None)
 
     args = parser.parse_args(input_args)
 
@@ -711,6 +743,36 @@ def parse_args(input_args=None):
 
     if args.lambda_anchor_visual > 0.0 and not args.use_precomputed_clip_embeds:
         raise ValueError("--lambda_anchor_visual requires --use_precomputed_clip_embeds")
+
+    if args.training_stage == "stage2":
+        if not args.use_sife:
+            raise ValueError("stage2 requires --use_sife")
+        if not args.use_ssfe:
+            raise ValueError("stage2 requires --use_ssfe")
+        if args.load_sife_path is None:
+            raise ValueError("stage2 requires --load_sife_path")
+        if args.eeg_backbone_ckpt is None:
+            raise ValueError("stage2 requires --eeg_backbone_ckpt")
+
+    if args.training_stage == "stage3":
+        if not args.use_sife:
+            raise ValueError("stage3 requires --use_sife")
+        if not args.use_ssfe:
+            raise ValueError("stage3 requires --use_ssfe")
+        if not args.use_prior:
+            raise ValueError("stage3 requires --use_prior")
+        if args.load_sife_path is None:
+            raise ValueError("stage3 requires --load_sife_path")
+        if args.load_ssfe_path is None:
+            raise ValueError("stage3 requires --load_ssfe_path")
+        if args.eeg_backbone_ckpt is None:
+            raise ValueError("stage3 requires --eeg_backbone_ckpt")
+        
+    if args.training_stage in {"stage1", "stage2", "stage3"} and not args.train_eeg_only:
+        raise ValueError("Staged training requires --train_eeg_only")
+    
+    if args.training_stage == "full" and args.freeze_controlnet:
+        raise ValueError("full training with --freeze_controlnet is not supported because it only wastes diffusion compute.")
 
     return args
 
@@ -802,64 +864,67 @@ def main(args):
     )
     empty_input_ids = _empty_tok.input_ids
 
-    text_encoder_cls = import_model_class_from_model_name_or_path(
-        args.pretrained_model_name_or_path,
-        args.revision,
-    )
+    need_diffusion_branch = not args.train_eeg_only
 
-    noise_scheduler = DDPMScheduler.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="scheduler",
-    )
-
-    text_encoder = text_encoder_cls.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="text_encoder",
-        revision=args.revision,
-        variant=args.variant,
-    )
-
-    text_dim = int(text_encoder.config.hidden_size)
-    accelerator.print(f"[AUTO] text_dim = {text_dim}")
-
-    anchor_clip_tokenizer = None
-    anchor_clip_text_model = None
-    anchor_text_dim = 512
-
-    if args.use_ssfe and args.lambda_anchor_text > 0.0:
-        anchor_clip_tokenizer = CLIPTokenizer.from_pretrained(
-            args.anchor_clip_model_name_or_path
-        )
-        anchor_clip_text_model = CLIPTextModelWithProjection.from_pretrained(
-            args.anchor_clip_model_name_or_path
-        )
-        anchor_text_dim = int(anchor_clip_text_model.config.projection_dim)
-
-        accelerator.print(
-            f"[ANCHOR] CLIP text dim={anchor_text_dim} | "
-            f"model={args.anchor_clip_model_name_or_path}"
-        )
-
-    if args.use_precomputed_latents:
-        vae = None
-    else:
-        vae = AutoencoderKL.from_pretrained(
+    if need_diffusion_branch:
+        text_encoder_cls = import_model_class_from_model_name_or_path(
             args.pretrained_model_name_or_path,
-            subfolder="vae",
+            args.revision,
+        )
+    else:
+        text_encoder_cls = None
+
+    if need_diffusion_branch:
+        noise_scheduler = DDPMScheduler.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="scheduler",
+        )
+    else:
+        noise_scheduler = None
+
+    if need_diffusion_branch:
+        text_encoder = text_encoder_cls.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="text_encoder",
             revision=args.revision,
             variant=args.variant,
         )
 
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="unet",
-        revision=args.revision,
-        variant=args.variant,
-    )
+        text_dim = int(text_encoder.config.hidden_size)
+        accelerator.print(f"[AUTO] text_dim = {text_dim}")
+    else:
+        text_encoder = None
+        text_dim = None
 
-    logger.info("Initializing ControlNet from UNet")
-    n_subjects = 6 if "CVPR" in args.dataset_name.upper() else 24
-    controlnet = ControlNetModel.from_unet(unet, n_subjects=n_subjects)
+    anchor_text_dim = None
+
+    if need_diffusion_branch:
+        if args.use_precomputed_latents:
+            vae = None
+        else:
+            vae = AutoencoderKL.from_pretrained(
+                args.pretrained_model_name_or_path,
+                subfolder="vae",
+                revision=args.revision,
+                variant=args.variant,
+            )
+    else:
+        vae = None
+
+    if need_diffusion_branch:
+        unet = UNet2DConditionModel.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="unet",
+            revision=args.revision,
+            variant=args.variant,
+        )
+
+        logger.info("Initializing ControlNet from UNet")
+        n_subjects = 6 if "CVPR" in args.dataset_name.upper() else 24
+        controlnet = ControlNetModel.from_unet(unet, n_subjects=n_subjects)
+    else:
+        unet = None
+        controlnet = None
 
     # SIFE: classi locali solo sui soggetti di train
     active_train_subjects = sorted(set(int(s) for s in args.train_subjects))
@@ -944,7 +1009,16 @@ def main(args):
             num_heads=args.sife_num_heads,
             grl_lambda=args.grl_lambda_sife,
         )
+
+        if args.gradient_checkpointing_sife:
+            sife.set_gradient_checkpointing(True)
+            accelerator.print("[SIFE] gradient checkpointing enabled")
+
         sife.train()
+
+        if args.load_sife_path is not None:
+            sife.load_state_dict(torch.load(args.load_sife_path, map_location="cpu"))
+            accelerator.print(f"[LOAD] Loaded SIFE from {args.load_sife_path}")
 
     # ---------------------------------------------------------
     # EEG reconstruction decoder
@@ -959,36 +1033,23 @@ def main(args):
         )
         recon_decoder.train()
 
+        if args.load_recon_path is not None:
+            recon_decoder.load_state_dict(torch.load(args.load_recon_path, map_location="cpu"))
+            accelerator.print(f"[LOAD] Loaded recon decoder from {args.load_recon_path}")
+
     # ---------------------------------------------------------
     # SSFE projector
     # ---------------------------------------------------------
-    ssfe_projector = None
-    if args.use_ssfe:
-        ssfe_projector = SSFEProjector(
-            in_dim=args.eeg_backbone_hidden_size,
-            hidden_dim=args.ssfe_hidden_dim,
-            out_dim=args.ssfe_out_dim,
-            target_tokens=args.ssfe_target_tokens,
-            adapter_type=args.ssfe_adapter_type,
-            num_image_classes=args.num_image_classes,
-            grl_lambda=args.grl_lambda_ssfe,
-            text_out_dim=anchor_text_dim,
-        )
-        ssfe_projector.train()
-
-        accelerator.print(
-            f"[SSFE] adapter_type={args.ssfe_adapter_type} | "
-            f"target_tokens={args.ssfe_target_tokens} | "
-            f"out_dim={args.ssfe_out_dim}"
-        )
-
     if args.use_ssfe and args.use_precomputed_clip_embeds:
         first_ex = train_dataset[0]
 
         if "clip_img_embeds" not in first_ex:
-            raise RuntimeError("SSFE with CLIP supervision requires clip_img_embeds in dataset.")
+            raise RuntimeError("SSFE with OpenCLIP supervision requires clip_img_embeds in dataset.")
+        if "clip_text_embeds" not in first_ex:
+            raise RuntimeError("SSFE with anchor text supervision requires clip_text_embeds in dataset.")
 
         clip_ex = first_ex["clip_img_embeds"]
+        clip_text_ex = first_ex["clip_text_embeds"]
 
         if clip_ex.ndim != 2:
             raise RuntimeError(
@@ -996,7 +1057,14 @@ def main(args):
                 f"but got {tuple(clip_ex.shape)}"
             )
 
+        if clip_text_ex.ndim != 1:
+            raise RuntimeError(
+                f"SSFE expects pooled clip_text_embeds with shape (D,), "
+                f"but got {tuple(clip_text_ex.shape)}"
+            )
+
         inferred_num_tokens, inferred_clip_dim = clip_ex.shape
+        inferred_text_dim = int(clip_text_ex.shape[0])
 
         if int(args.ssfe_target_tokens) != inferred_num_tokens:
             raise ValueError(
@@ -1010,12 +1078,48 @@ def main(args):
                 f"Set --ssfe_out_dim accordingly."
             )
 
+        anchor_text_dim = inferred_text_dim
+
         accelerator.print(
             f"[SSFE/CLIP] dataset_tokens={inferred_num_tokens} | "
             f"dataset_dim={inferred_clip_dim} | "
+            f"text_dim={anchor_text_dim} | "
             f"ssfe_target_tokens={args.ssfe_target_tokens} | "
             f"ssfe_out_dim={args.ssfe_out_dim}"
         )
+    else:
+        if args.lambda_anchor_text > 0.0:
+            raise ValueError("--lambda_anchor_text > 0 requires --use_precomputed_clip_embeds with clip_text_embeds available.")
+        anchor_text_dim = 1280
+
+    ssfe_projector = None
+    if args.use_ssfe:
+        ssfe_projector = SSFEProjector(
+            in_dim=args.eeg_backbone_hidden_size,
+            hidden_dim=args.ssfe_hidden_dim,
+            out_dim=args.ssfe_out_dim,
+            target_tokens=args.ssfe_target_tokens,
+            adapter_type=args.ssfe_adapter_type,
+            num_image_classes=args.num_image_classes,
+            grl_lambda=args.grl_lambda_ssfe,
+            text_out_dim=anchor_text_dim,
+        )
+
+        if args.gradient_checkpointing_ssfe:
+            ssfe_projector.set_gradient_checkpointing(True)
+            accelerator.print("[SSFE] gradient checkpointing enabled")
+            
+        ssfe_projector.train()
+
+        accelerator.print(
+            f"[SSFE] adapter_type={args.ssfe_adapter_type} | "
+            f"target_tokens={args.ssfe_target_tokens} | "
+            f"out_dim={args.ssfe_out_dim}"
+        )
+
+        if args.load_ssfe_path is not None:
+            ssfe_projector.load_state_dict(torch.load(args.load_ssfe_path, map_location="cpu"))
+            accelerator.print(f"[LOAD] Loaded SSFE projector from {args.load_ssfe_path}")
 
     # ---------------------------------------------------------
     # PRIOR
@@ -1060,10 +1164,24 @@ def main(args):
             num_timesteps=int(args.prior_timesteps),
             depth=int(args.prior_depth),
             heads=int(args.prior_heads),
-            mlp_ratio=4.0,
-            dropout=0.0,
+            dim_head=52,
+            ff_mult=4,
+            attn_dropout=0.0,
+            ff_dropout=0.0,
+            norm_in=False,
+            norm_out=True,
+            final_proj=True,
+            normformer=False,
+            causal=False,
             learned_query_mode="pos_emb",
         )
+
+        if args.gradient_checkpointing_prior:
+            if hasattr(prior_network, "set_gradient_checkpointing"):
+                prior_network.set_gradient_checkpointing(True)
+                accelerator.print("[PRIOR] gradient checkpointing enabled")
+            else:
+                accelerator.print("[PRIOR] gradient checkpointing requested, but not implemented in current PriorNetwork")
 
         diffusion_prior = BrainDiffusionPrior(
             net=prior_network,
@@ -1082,33 +1200,100 @@ def main(args):
             f"depth={args.prior_depth} | heads={args.prior_heads} | timesteps={args.prior_timesteps}"
         )
 
+        if args.load_prior_path is not None:
+            diffusion_prior.load_state_dict(torch.load(args.load_prior_path, map_location="cpu"))
+            accelerator.print(f"[LOAD] Loaded diffusion prior from {args.load_prior_path}")
+
     # ---------------------------------------------------------
     # Freeze base models
     # ---------------------------------------------------------
     if vae is not None:
         vae.requires_grad_(False)
-    unet.requires_grad_(False)
-    text_encoder.requires_grad_(False)
 
-    if anchor_clip_text_model is not None:
-        anchor_clip_text_model.requires_grad_(False)
-        anchor_clip_text_model.eval()
+    if unet is not None:
+        unet.requires_grad_(False)
 
-    if args.train_eeg_only:
-        controlnet.requires_grad_(False)
-        controlnet.eval()
-    elif args.freeze_controlnet:
-        controlnet.requires_grad_(False)
-        controlnet.eval()
-    else:
-        controlnet.train()
+    if text_encoder is not None:
+        text_encoder.requires_grad_(False)
 
-    if args.enable_xformers_memory_efficient_attention:
+    if controlnet is not None:
+        if args.freeze_controlnet:
+            controlnet.requires_grad_(False)
+            controlnet.eval()
+        else:
+            controlnet.train()
+
+    if args.enable_xformers_memory_efficient_attention and need_diffusion_branch:
         if is_xformers_available():
             unet.enable_xformers_memory_efficient_attention()
             controlnet.enable_xformers_memory_efficient_attention()
         else:
             raise ValueError("xformers not available")
+        
+    is_stage1 = args.training_stage == "stage1"
+    is_stage2 = args.training_stage == "stage2"
+    is_stage3 = args.training_stage == "stage3"
+    is_full = args.training_stage == "full"
+
+    if is_stage1:
+        eeg_backbone.requires_grad_(True)
+        eeg_backbone.train()
+
+        if sife is not None:
+            sife.requires_grad_(True)
+            sife.train()
+
+        if recon_decoder is not None:
+            recon_decoder.requires_grad_(True)
+            recon_decoder.train()
+
+        if ssfe_projector is not None:
+            ssfe_projector.requires_grad_(False)
+            ssfe_projector.eval()
+
+        if diffusion_prior is not None:
+            diffusion_prior.requires_grad_(False)
+            diffusion_prior.eval()
+
+    elif is_stage2:
+        eeg_backbone.requires_grad_(False)
+        eeg_backbone.eval()
+
+        if sife is not None:
+            sife.requires_grad_(False)
+            sife.eval()
+
+        if recon_decoder is not None:
+            recon_decoder.requires_grad_(False)
+            recon_decoder.eval()
+
+        if ssfe_projector is not None:
+            ssfe_projector.requires_grad_(True)
+            ssfe_projector.train()
+
+        if diffusion_prior is not None:
+            diffusion_prior.requires_grad_(False)
+            diffusion_prior.eval()
+
+    elif is_stage3:
+        eeg_backbone.requires_grad_(False)
+        eeg_backbone.eval()
+
+        if sife is not None:
+            sife.requires_grad_(False)
+            sife.eval()
+
+        if recon_decoder is not None:
+            recon_decoder.requires_grad_(False)
+            recon_decoder.eval()
+
+        if ssfe_projector is not None:
+            ssfe_projector.requires_grad_(False)
+            ssfe_projector.eval()
+
+        if diffusion_prior is not None:
+            diffusion_prior.requires_grad_(True)
+            diffusion_prior.train()
 
     # ---------------------------------------------------------
     # Optimizer
@@ -1121,8 +1306,8 @@ def main(args):
     lr_prior = float(args.prior_lr) if args.prior_lr is not None else lr_main
 
     params_main = []
-    if (not args.train_eeg_only) and (not args.freeze_controlnet):
-        params_main += list(controlnet.parameters())
+    if controlnet is not None and (not args.freeze_controlnet):
+        params_main += [p for p in controlnet.parameters() if p.requires_grad]
 
     params_eeg = [p for p in eeg_backbone.parameters() if p.requires_grad]
     params_sife = [p for p in sife.parameters() if p.requires_grad] if sife is not None else []
@@ -1173,7 +1358,11 @@ def main(args):
     # ---------------------------------------------------------
     # Prepare
     # ---------------------------------------------------------
-    prepare_items = [controlnet, eeg_backbone]
+    prepare_items = []
+    if controlnet is not None:
+        prepare_items.append(controlnet)
+    prepare_items.append(eeg_backbone)
+
     if sife is not None:
         prepare_items.append(sife)
     if recon_decoder is not None:
@@ -1187,8 +1376,13 @@ def main(args):
     prepared = accelerator.prepare(*prepare_items)
 
     idx = 0
-    controlnet = prepared[idx]; idx += 1
-    eeg_backbone = prepared[idx]; idx += 1
+    if controlnet is not None:
+        controlnet = prepared[idx]
+        idx += 1
+
+    eeg_backbone = prepared[idx]
+    idx += 1
+
     if sife is not None:
         sife = prepared[idx]; idx += 1
     if recon_decoder is not None:
@@ -1201,6 +1395,32 @@ def main(args):
     train_dataloader = prepared[idx]; idx += 1
     val_dataloader = prepared[idx]; idx += 1
     lr_scheduler = prepared[idx]; idx += 1
+
+    accum_models = []
+
+    if len(params_main) > 0 and controlnet is not None:
+        accum_models.append(controlnet)
+    if len(params_eeg) > 0:
+        accum_models.append(eeg_backbone)
+    if len(params_sife) > 0 and sife is not None:
+        accum_models.append(sife)
+    if len(params_recon) > 0 and recon_decoder is not None:
+        accum_models.append(recon_decoder)
+    if len(params_ssfe) > 0 and ssfe_projector is not None:
+        accum_models.append(ssfe_projector)
+    if len(params_prior) > 0 and diffusion_prior is not None:
+        accum_models.append(diffusion_prior)
+
+    if len(accum_models) == 0:
+        raise ValueError("No trainable modules found for gradient accumulation.")
+    
+    params_to_clip = []
+    seen = set()
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            if p.requires_grad and id(p) not in seen:
+                params_to_clip.append(p)
+                seen.add(id(p))
 
     # ---------------------------------------------------------
     # Resume
@@ -1251,8 +1471,12 @@ def main(args):
 
     if vae is not None:
         vae.to(accelerator.device, dtype=torch.float32)
-    unet.to(accelerator.device, dtype=weight_dtype)
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
+    if unet is not None:
+        unet.to(accelerator.device, dtype=weight_dtype)
+    if text_encoder is not None:
+        text_encoder.to(accelerator.device, dtype=weight_dtype)
+
+    # trainable modules: keep in fp32
     eeg_backbone.to(accelerator.device, dtype=torch.float32)
     if sife is not None:
         sife.to(accelerator.device, dtype=torch.float32)
@@ -1262,8 +1486,9 @@ def main(args):
         ssfe_projector.to(accelerator.device, dtype=torch.float32)
     if diffusion_prior is not None:
         diffusion_prior.to(accelerator.device, dtype=torch.float32)
-    if anchor_clip_text_model is not None:
-        anchor_clip_text_model.to(accelerator.device, dtype=weight_dtype)
+
+    ssfe_dtype = torch.float32
+    prior_dtype = torch.float32
 
     if accelerator.is_main_process:
         config = vars(args).copy()
@@ -1286,13 +1511,58 @@ def main(args):
     # ---------------------------------------------------------
     # TRAIN LOOP
     # ---------------------------------------------------------
+    debug_printed_once = False
+
     for epoch in range(first_epoch, args.num_train_epochs):
+        epoch_loss_sum = 0.0
+        epoch_diffusion_loss_sum = 0.0
+        epoch_recon_loss_sum = 0.0
+        epoch_ssfe_loss_sum = 0.0
+        epoch_prior_loss_sum = 0.0
+
+        epoch_sife_inv_sum = 0.0
+        epoch_sife_spec_sum = 0.0
+        epoch_inv_acc_sum = 0.0
+        epoch_spec_acc_sum = 0.0
+
+        epoch_img_cls_loss_sum = 0.0
+        epoch_img_dis_loss_sum = 0.0
+        epoch_img_cls_acc_sum = 0.0
+        epoch_img_dis_acc_sum = 0.0
+
+        epoch_anchor_cls_loss_sum = 0.0
+        epoch_anchor_visual_loss_sum = 0.0
+        epoch_anchor_text_loss_sum = 0.0
+        epoch_anchor_cls_acc_sum = 0.0
+
+        epoch_e_norm_sum = 0.0
+        epoch_ei_norm_sum = 0.0
+        epoch_es_norm_sum = 0.0
+        epoch_ei_es_ratio_sum = 0.0
+        epoch_ei_es_cos_sum = 0.0
+
+        epoch_inv_entropy_sum = 0.0
+        epoch_spec_entropy_sum = 0.0
+        epoch_inv_entropy_norm_sum = 0.0
+        epoch_spec_entropy_norm_sum = 0.0
+
+        epoch_random_subject_acc_sum = 0.0
+        epoch_inv_gap_sum = 0.0
+        epoch_spec_gap_sum = 0.0
+
+        epoch_lr_sum = 0.0
+        epoch_logged_steps = 0
+
         for step, batch in enumerate(train_dataloader):
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step_in_epoch:
                 continue
 
-            accum_model = eeg_backbone if args.train_eeg_only else controlnet
-            with accelerator.accumulate(accum_model):
+            with accelerator.accumulate(*accum_models):
+                stage1_mode = is_stage1
+                stage2_mode = is_stage2
+                stage3_mode = is_stage3
+                full_mode = is_full
+
                 eeg_cond = batch["conditioning_pixel_values"].to(
                     accelerator.device,
                     dtype=weight_dtype,
@@ -1303,11 +1573,49 @@ def main(args):
                 )
 
                 # ---------------------------------------------------------
-                # GWIT EEG backbone
+                # GWIT EEG backbone (+ optional SIFE)
                 # ---------------------------------------------------------
-                eeg_feats = eeg_backbone(eeg_cond.float())
-                E_seq = eeg_feats["sequence"]   # (B, T, D)
-                E_pooled = eeg_feats["pooled"]  # (B, D)
+                if stage2_mode or stage3_mode:
+                    with torch.no_grad():
+                        eeg_feats = eeg_backbone(eeg_cond.float())
+                        E_seq = eeg_feats["sequence"]   # (B, T, D)
+                        E_pooled = eeg_feats["pooled"]  # (B, D)
+
+                        if sife is not None:
+                            sife_out = sife(E_seq)
+                            E_i_seq = sife_out["E_i_seq"]
+                            E_s_seq = sife_out["E_s_seq"]
+                            E_i = sife_out["E_i"]
+                            E_s = sife_out["E_s"]
+                            pred_subject_i = sife_out["pred_subject_i"]
+                            pred_subject_s = sife_out["pred_subject_s"]
+                        else:
+                            E_i_seq = None
+                            E_s_seq = None
+                            E_i = None
+                            E_s = None
+                            pred_subject_i = None
+                            pred_subject_s = None
+                else:
+                    eeg_feats = eeg_backbone(eeg_cond.float())
+                    E_seq = eeg_feats["sequence"]   # (B, T, D)
+                    E_pooled = eeg_feats["pooled"]  # (B, D)
+
+                    if sife is not None:
+                        sife_out = sife(E_seq)
+                        E_i_seq = sife_out["E_i_seq"]
+                        E_s_seq = sife_out["E_s_seq"]
+                        E_i = sife_out["E_i"]
+                        E_s = sife_out["E_s"]
+                        pred_subject_i = sife_out["pred_subject_i"]
+                        pred_subject_s = sife_out["pred_subject_s"]
+                    else:
+                        E_i_seq = None
+                        E_s_seq = None
+                        E_i = None
+                        E_s = None
+                        pred_subject_i = None
+                        pred_subject_s = None
 
                 sife_loss_inv = torch.tensor(0.0, device=accelerator.device)
                 sife_loss_spec = torch.tensor(0.0, device=accelerator.device)
@@ -1330,20 +1638,12 @@ def main(args):
                 image_dis_acc = torch.tensor(0.0, device=accelerator.device)
                 anchor_cls_acc = torch.tensor(0.0, device=accelerator.device)
 
-                E_i = None
-                E_s = None
-                E_i_seq = None
-                E_s_seq = None
-
                 F_s = None
                 F_i = None
                 F_anchor = None
                 F_anchor_visual = None
-
                 anchor_text_embed = None
-                clip_target = None
 
-                # DEBUG
                 E_i_norm = torch.tensor(0.0, device=accelerator.device)
                 E_s_norm = torch.tensor(0.0, device=accelerator.device)
                 Ei_Es_norm_ratio = torch.tensor(0.0, device=accelerator.device)
@@ -1359,16 +1659,7 @@ def main(args):
                 spec_entropy_norm = torch.tensor(0.0, device=accelerator.device)
                 Ei_Es_cos = torch.tensor(0.0, device=accelerator.device)
 
-                if sife is not None:
-                    sife_out = sife(E_seq)
-
-                    E_i_seq = sife_out["E_i_seq"]
-                    E_s_seq = sife_out["E_s_seq"]
-                    E_i = sife_out["E_i"]
-                    E_s = sife_out["E_s"]
-                    pred_subject_i = sife_out["pred_subject_i"]
-                    pred_subject_s = sife_out["pred_subject_s"]
-
+                if sife is not None and (stage1_mode or full_mode):
                     subject_targets = remap_subject_targets(
                         batch["eeg_subjects"].to(accelerator.device),
                         subject_to_local,
@@ -1382,7 +1673,6 @@ def main(args):
                     inv_acc = (pred_i_cls == subject_targets).float().mean()
                     spec_acc = (pred_s_cls == subject_targets).float().mean()
 
-                    # DEBUG pooled monitors
                     E_i_norm = E_i.norm(dim=-1).mean()
                     E_s_norm = E_s.norm(dim=-1).mean()
                     Ei_Es_norm_ratio = E_i_norm / (E_s_norm + 1e-8)
@@ -1408,26 +1698,24 @@ def main(args):
                     inv_acc_gap_vs_random = inv_acc - random_subject_acc
                     spec_acc_gap_vs_random = spec_acc - random_subject_acc
 
-                    if global_step == 0 and accelerator.is_main_process:
-                        accelerator.print(f"[DEBUG] E_seq shape: {tuple(E_seq.shape)}")
-                        accelerator.print(f"[DEBUG] E_pooled shape: {tuple(E_pooled.shape)}")
+                if (not debug_printed_once) and accelerator.is_main_process:
+                    accelerator.print(f"[DEBUG] E_seq shape: {tuple(E_seq.shape)}")
+                    accelerator.print(f"[DEBUG] E_pooled shape: {tuple(E_pooled.shape)}")
+                    if E_i_seq is not None:
                         accelerator.print(f"[DEBUG] E_i_seq shape: {tuple(E_i_seq.shape)}")
                         accelerator.print(f"[DEBUG] E_s_seq shape: {tuple(E_s_seq.shape)}")
                         accelerator.print(f"[DEBUG] E_i shape: {tuple(E_i.shape)}")
                         accelerator.print(f"[DEBUG] E_s shape: {tuple(E_s.shape)}")
+                    if pred_subject_i is not None:
                         accelerator.print(f"[DEBUG] pred_subject_i shape: {tuple(pred_subject_i.shape)}")
                         accelerator.print(f"[DEBUG] pred_subject_s shape: {tuple(pred_subject_s.shape)}")
-                        accelerator.print(f"[DEBUG] active_train_subjects: {active_train_subjects}")
-                        accelerator.print(f"[DEBUG] subject_to_local: {subject_to_local}")
-                else:
-                    if global_step == 0 and accelerator.is_main_process:
-                        accelerator.print(f"[DEBUG] E_seq shape: {tuple(E_seq.shape)}")
-                        accelerator.print(f"[DEBUG] E_pooled shape: {tuple(E_pooled.shape)}")
+                    accelerator.print(f"[DEBUG] active_train_subjects: {active_train_subjects}")
+                    accelerator.print(f"[DEBUG] subject_to_local: {subject_to_local}")
 
                 # ---------------------------------------------------------
                 # EEG reconstruction loss from E_seq
                 # ---------------------------------------------------------
-                if recon_decoder is not None:
+                if recon_decoder is not None and (stage1_mode or full_mode):
                     eeg_recon = recon_decoder(E_seq.float())
                     eeg_target = eeg_cond.float()
 
@@ -1440,163 +1728,72 @@ def main(args):
                     else:
                         raise ValueError(f"Unsupported recon_loss_type: {args.recon_loss_type}")
 
-                    if global_step == 0 and accelerator.is_main_process:
+                    if (not debug_printed_once) and accelerator.is_main_process:
                         accelerator.print(f"[DEBUG] eeg_recon shape: {tuple(eeg_recon.shape)}")
                         accelerator.print(f"[DEBUG] eeg_target shape: {tuple(eeg_target.shape)}")
 
                 # ---------------------------------------------------------
                 # SSFE + anchor losses
                 # ---------------------------------------------------------
-                if ssfe_projector is not None:
+                clip_target_ssfe = None
+                clip_target_prior = None
+
+                if ssfe_projector is not None and (stage2_mode or full_mode):
                     if E_i_seq is None:
                         raise RuntimeError("SSFE requires E_i_seq from SIFE.")
 
                     ssfe_out = ssfe_projector(
-                        E_i=E_i_seq.float(),
-                        E=E_seq.float(),
+                        E_i=E_i_seq.to(dtype=ssfe_dtype),
+                        E=E_seq.to(dtype=ssfe_dtype),
                     )
 
                     F_s = ssfe_out["F_s"]
-                    F_anchor = ssfe_out["F"]                 # general anchor F = P(E)
-                    F_anchor_visual = ssfe_out["F_anchor_visual"]   # in ZEBRA-aligned SSFE this is exactly F
+                    F_anchor = ssfe_out["F"]
+                    F_anchor_visual = ssfe_out["F_anchor_visual"]
                     F_i = ssfe_out["F_i"]
                     anchor_text_embed = ssfe_out["anchor_text_embed"]
 
                     pred_image_cls = ssfe_out["pred_image_cls"]
                     pred_image_dis = ssfe_out["pred_image_dis"]
+                    pred_image_cls_anchor = ssfe_out["pred_image_cls_anchor"]
 
-                    # semantic branch losses
-                    image_cls_loss = F.cross_entropy(pred_image_cls, image_labels)
-                    image_dis_loss = F.cross_entropy(pred_image_dis, image_labels)
+                    image_cls_loss = F.cross_entropy(pred_image_cls.float(), image_labels)
+                    image_dis_loss = F.cross_entropy(pred_image_dis.float(), image_labels)
+                    anchor_cls_loss = F.cross_entropy(pred_image_cls_anchor.float(), image_labels)
 
                     image_cls_acc = (pred_image_cls.argmax(dim=-1) == image_labels).float().mean()
                     image_dis_acc = (pred_image_dis.argmax(dim=-1) == image_labels).float().mean()
-
-                    # anchor class loss on F
-                    # (ZEBRA-aligned: same ImageClassifier module is reused on both F_s and F)
-                    pred_image_cls_anchor = ssfe_out["pred_image_cls_anchor"]
-                    anchor_cls_loss = F.cross_entropy(pred_image_cls_anchor, image_labels)
                     anchor_cls_acc = (
-                        (pred_image_cls_anchor.argmax(dim=-1) == image_labels).float().mean()
-                    )
+                        pred_image_cls_anchor.argmax(dim=-1) == image_labels
+                    ).float().mean()
 
-                    # load CLIP image target once if needed
-                    if args.lambda_anchor_visual > 0.0 or diffusion_prior is not None:
-                        clip_target = batch["clip_img_embeds"].to(
+                    if args.lambda_anchor_visual > 0.0:
+                        clip_target_ssfe = batch["clip_img_embeds"].to(
                             accelerator.device,
-                            dtype=torch.float32,
+                            dtype=ssfe_dtype,
                         )
 
-                    # anchor visual loss: direct alignment F vs CLIP image tokens
-                    # (ZEBRA-aligned: no dedicated visual projector downstream of F)
-                    if args.lambda_anchor_visual > 0.0:
-                        if clip_target.ndim != 3:
+                        if clip_target_ssfe.ndim != 3:
                             raise RuntimeError(
                                 f"Anchor visual loss expects sequence-level clip_img_embeds "
-                                f"with shape (B, T, D), got {tuple(clip_target.shape)}"
+                                f"with shape (B, T, D), got {tuple(clip_target_ssfe.shape)}"
                             )
 
                         anchor_visual_loss = sequence_info_nce_loss(
                             F_anchor_visual.float(),
-                            clip_target.float(),
+                            clip_target_ssfe.float(),
                             temperature=args.anchor_visual_temperature,
                         )
 
-                        ###### DEBUG ######
-                        if global_step % args.console_log_every == 0 and accelerator.sync_gradients:
-                            pred_flat = F.normalize(F_anchor_visual.float().reshape(F_anchor_visual.shape[0], -1), dim=-1)
-                            tgt_flat = F.normalize(clip_target.float().reshape(clip_target.shape[0], -1), dim=-1)
-
-                            sim_pred = pred_flat @ pred_flat.t()
-                            sim_tgt = tgt_flat @ tgt_flat.t()
-
-                            bsz = sim_pred.shape[0]
-                            eye = torch.eye(bsz, device=sim_pred.device, dtype=torch.bool)
-
-                            pred_diag = sim_pred[eye].mean()
-                            pred_offdiag = sim_pred[~eye].mean()
-
-                            tgt_diag = sim_tgt[eye].mean()
-                            tgt_offdiag = sim_tgt[~eye].mean()
-
-                            pred_sample_var = pred_flat.var(dim=0).mean()
-                            pred_norm_mean = F_anchor_visual.float().norm(dim=-1).mean()
-
-                            accelerator.print(
-                                "[DEBUG][ANCHOR_STATS] "
-                                f"pred_diag={pred_diag.item():.4f} | "
-                                f"pred_offdiag={pred_offdiag.item():.4f} | "
-                                f"tgt_diag={tgt_diag.item():.4f} | "
-                                f"tgt_offdiag={tgt_offdiag.item():.4f} | "
-                                f"pred_var={pred_sample_var.item():.6f} | "
-                                f"pred_token_norm={pred_norm_mean.item():.4f}"
-                            )
-
-                            accelerator.log(
-                                {
-                                    "debug/anchor_stats/pred_diag": pred_diag.item(),
-                                    "debug/anchor_stats/pred_offdiag": pred_offdiag.item(),
-                                    "debug/anchor_stats/tgt_diag": tgt_diag.item(),
-                                    "debug/anchor_stats/tgt_offdiag": tgt_offdiag.item(),
-                                    "debug/anchor_stats/pred_var": pred_sample_var.item(),
-                                    "debug/anchor_stats/pred_token_norm": pred_norm_mean.item(),
-                                },
-                                step=global_step,
-                            )
-
-                        if global_step % args.console_log_every == 0 and accelerator.sync_gradients and accelerator.is_main_process:
-                            pred_flat = F.normalize(F_anchor_visual.float().reshape(F_anchor_visual.shape[0], -1), dim=-1)
-                            tgt_flat = F.normalize(clip_target.float().reshape(clip_target.shape[0], -1), dim=-1)
-
-                            sim = pred_flat @ tgt_flat.t()  # (B, B)
-                            diag = sim.diag()
-                            offdiag = sim[~torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)]
-
-                            top1 = (sim.argmax(dim=1) == torch.arange(sim.shape[0], device=sim.device)).float().mean()
-
-                            accelerator.print(
-                                f"[DEBUG][ANCHOR_VIS_SIM] "
-                                f"diag_mean={diag.mean().item():.4f} | "
-                                f"diag_min={diag.min().item():.4f} | "
-                                f"diag_max={diag.max().item():.4f} | "
-                                f"offdiag_mean={offdiag.mean().item():.4f} | "
-                                f"top1={top1.item():.4f}"
-                            )
-
-                            accelerator.log(
-                                {
-                                    "debug/anchor_vis_sim/diag_mean": diag.mean().item(),
-                                    "debug/anchor_vis_sim/diag_min": diag.min().item(),
-                                    "debug/anchor_vis_sim/diag_max": diag.max().item(),
-                                    "debug/anchor_vis_sim/offdiag_mean": offdiag.mean().item(),
-                                    "debug/anchor_vis_sim/top1": top1.item(),
-                                },
-                                step=global_step,
-                            )
-                        ###################
-
-                    # anchor text loss: pooled F vs CLIP text pooled embeddings
                     if args.lambda_anchor_text > 0.0:
-                        clip_text_inputs = anchor_clip_tokenizer(
-                            batch["caption_text"],
-                            padding="max_length",
-                            truncation=True,
-                            max_length=anchor_clip_tokenizer.model_max_length,
-                            return_tensors="pt",
+                        text_target = batch["clip_text_embeds"].to(
+                            accelerator.device,
+                            dtype=ssfe_dtype,
                         )
-
-                        clip_text_inputs = {
-                            "input_ids": clip_text_inputs["input_ids"].to(accelerator.device),
-                            "attention_mask": clip_text_inputs["attention_mask"].to(accelerator.device),
-                        }
-
-                        with torch.no_grad():
-                            text_out = anchor_clip_text_model(**clip_text_inputs, return_dict=True)
-                            text_target = F.normalize(text_out.text_embeds.float(), dim=-1)
 
                         anchor_text_loss = info_nce_loss(
                             anchor_text_embed.float(),
-                            text_target,
+                            text_target.float(),
                             temperature=args.anchor_text_temperature,
                         )
 
@@ -1608,7 +1805,7 @@ def main(args):
                         + float(args.lambda_anchor_text) * anchor_text_loss
                     )
 
-                    if global_step == 0 and accelerator.is_main_process:
+                    if (not debug_printed_once) and accelerator.is_main_process:
                         accelerator.print(f"[DEBUG] F_s shape: {tuple(F_s.shape)}")
                         accelerator.print(f"[DEBUG] F_i shape: {tuple(F_i.shape)}")
                         accelerator.print(f"[DEBUG] F shape: {tuple(F_anchor.shape)}")
@@ -1620,39 +1817,56 @@ def main(args):
                         accelerator.print(f"[DEBUG] pred_image_cls shape: {tuple(pred_image_cls.shape)}")
                         accelerator.print(f"[DEBUG] pred_image_dis shape: {tuple(pred_image_dis.shape)}")
                         accelerator.print(f"[DEBUG] image_labels shape: {tuple(image_labels.shape)}")
-                        if clip_target is not None:
-                            accelerator.print(f"[DEBUG] clip_target shape: {tuple(clip_target.shape)}")
+                        if clip_target_ssfe is not None:
+                            accelerator.print(f"[DEBUG] clip_target_ssfe shape: {tuple(clip_target_ssfe.shape)}")
+
+                elif ssfe_projector is not None and stage3_mode:
+                    if E_i_seq is None:
+                        raise RuntimeError("Stage3 prior requires E_i_seq from SIFE.")
+
+                    with torch.no_grad():
+                        ssfe_out = ssfe_projector(
+                            E_i=E_i_seq.to(dtype=ssfe_dtype),
+                            E=E_seq.to(dtype=ssfe_dtype),
+                        )
+                        F_s = ssfe_out["F_s"]
+
+                    if (not debug_printed_once) and accelerator.is_main_process:
+                        accelerator.print(f"[DEBUG] stage3 F_s shape: {tuple(F_s.shape)}")
 
                 # ---------------------------------------------------------
                 # PRIOR loss
                 #   text_embed  = F_s   (semantic branch only, unchanged)
                 #   image_embed = CLIP image tokens
                 # ---------------------------------------------------------
-                if diffusion_prior is not None:
+                if diffusion_prior is not None and (stage3_mode or full_mode):
                     if F_s is None:
                         raise RuntimeError("Prior requires F_s from SSFE.")
 
-                    if clip_target is None:
-                        clip_target = batch["clip_img_embeds"].to(
+                    if clip_target_prior is None:
+                        clip_target_prior = batch["clip_img_embeds"].to(
                             accelerator.device,
-                            dtype=torch.float32,
+                            dtype=prior_dtype,
                         )
 
-                    if clip_target.ndim != 3:
+                    if clip_target_prior.ndim != 3:
                         raise RuntimeError(
                             f"Prior expects sequence-level clip_img_embeds with shape (B, T, D), "
-                            f"but got {tuple(clip_target.shape)}"
+                            f"but got {tuple(clip_target_prior.shape)}"
                         )
 
                     prior_loss, prior_pred = diffusion_prior(
-                        text_embed=F_s.float(),
-                        image_embed=clip_target.float(),
+                        text_embed=F_s.to(dtype=prior_dtype),
+                        image_embed=clip_target_prior,
                     )
 
-                    if global_step == 0 and accelerator.is_main_process:
+                    if (not debug_printed_once) and accelerator.is_main_process:
                         accelerator.print(f"[DEBUG] prior text_embed/F_s shape: {tuple(F_s.shape)}")
-                        accelerator.print(f"[DEBUG] prior image_embed/clip_target shape: {tuple(clip_target.shape)}")
+                        accelerator.print(f"[DEBUG] prior image_embed/clip_target_prior shape: {tuple(clip_target_prior.shape)}")
                         accelerator.print(f"[DEBUG] prior_pred shape: {tuple(prior_pred.shape)}")
+
+                if (not debug_printed_once) and accelerator.is_main_process:
+                    debug_printed_once = True
 
                 if not args.train_eeg_only:
                     # ---------------------------------------------------------
@@ -1727,43 +1941,29 @@ def main(args):
 
                 loss_total = torch.tensor(0.0, device=accelerator.device)
 
-                if not args.train_eeg_only:
+                if not args.train_eeg_only and full_mode:
                     loss_total = loss_total + diffusion_loss
 
-                if sife is not None:
+                if sife is not None and (stage1_mode or full_mode):
                     loss_total = (
                         loss_total
                         + float(args.lambda_subject_inv) * sife_loss_inv
                         + float(args.lambda_subject_spec) * sife_loss_spec
                     )
 
-                if recon_decoder is not None:
+                if recon_decoder is not None and (stage1_mode or full_mode):
                     loss_total = loss_total + float(args.lambda_recon) * recon_loss
 
-                if ssfe_projector is not None:
+                if ssfe_projector is not None and (stage2_mode or full_mode):
                     loss_total = loss_total + float(args.lambda_ssfe) * ssfe_loss
 
-                if diffusion_prior is not None:
+                if diffusion_prior is not None and (stage3_mode or full_mode):
                     loss_total = loss_total + float(args.lambda_prior) * prior_loss
 
                 accelerator.backward(loss_total)
 
-                if accelerator.sync_gradients:
-                    params_to_clip = []
-                    if (not args.train_eeg_only) and (not args.freeze_controlnet):
-                        params_to_clip += list(controlnet.parameters())
-                    params_to_clip += list(eeg_backbone.parameters())
-                    if sife is not None:
-                        params_to_clip += list(sife.parameters())
-                    if recon_decoder is not None:
-                        params_to_clip += list(recon_decoder.parameters())
-                    if ssfe_projector is not None:
-                        params_to_clip += list(ssfe_projector.parameters())
-                    if diffusion_prior is not None:
-                        params_to_clip += list(diffusion_prior.parameters())
-
-                    if len(params_to_clip) > 0:
-                        accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                if accelerator.sync_gradients and len(params_to_clip) > 0:
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                 optimizer.step()
                 lr_scheduler.step()
@@ -1772,6 +1972,47 @@ def main(args):
             if accelerator.sync_gradients:
                 global_step += 1
                 progress_bar.update(1)
+
+                current_epoch = global_step / num_update_steps_per_epoch
+
+                epoch_logged_steps += 1
+                epoch_loss_sum += loss_total.item()
+                epoch_diffusion_loss_sum += diffusion_loss.item()
+                epoch_recon_loss_sum += recon_loss.item()
+                epoch_ssfe_loss_sum += ssfe_loss.item()
+                epoch_prior_loss_sum += prior_loss.item()
+
+                epoch_sife_inv_sum += sife_loss_inv.item()
+                epoch_sife_spec_sum += sife_loss_spec.item()
+                epoch_inv_acc_sum += inv_acc.item()
+                epoch_spec_acc_sum += spec_acc.item()
+
+                epoch_img_cls_loss_sum += image_cls_loss.item()
+                epoch_img_dis_loss_sum += image_dis_loss.item()
+                epoch_img_cls_acc_sum += image_cls_acc.item()
+                epoch_img_dis_acc_sum += image_dis_acc.item()
+
+                epoch_anchor_cls_loss_sum += anchor_cls_loss.item()
+                epoch_anchor_visual_loss_sum += anchor_visual_loss.item()
+                epoch_anchor_text_loss_sum += anchor_text_loss.item()
+                epoch_anchor_cls_acc_sum += anchor_cls_acc.item()
+
+                epoch_e_norm_sum += E_pooled.norm(dim=-1).mean().item()
+                epoch_ei_norm_sum += E_i_norm.item()
+                epoch_es_norm_sum += E_s_norm.item()
+                epoch_ei_es_ratio_sum += Ei_Es_norm_ratio.item()
+                epoch_ei_es_cos_sum += Ei_Es_cos.item()
+
+                epoch_inv_entropy_sum += inv_entropy.item()
+                epoch_spec_entropy_sum += spec_entropy.item()
+                epoch_inv_entropy_norm_sum += inv_entropy_norm.item()
+                epoch_spec_entropy_norm_sum += spec_entropy_norm.item()
+
+                epoch_random_subject_acc_sum += random_subject_acc.item()
+                epoch_inv_gap_sum += inv_acc_gap_vs_random.item()
+                epoch_spec_gap_sum += spec_acc_gap_vs_random.item()
+
+                epoch_lr_sum += lr_scheduler.get_last_lr()[0]
 
                 if accelerator.is_main_process and (global_step % args.console_log_every == 0 or global_step == 1):
                     logger.info(
@@ -1811,6 +2052,7 @@ def main(args):
                     "diffusion_loss": diffusion_loss.item(),
                     "lr": lr_scheduler.get_last_lr()[0],
                     "E_norm": E_pooled.norm(dim=-1).mean().item(),
+                    "epoch": current_epoch,
                 }
 
                 if sife is not None:
@@ -1853,9 +2095,8 @@ def main(args):
 
                 accelerator.log(log_payload, step=global_step)
 
-                if global_step % args.validation_steps == 0 and accelerator.is_main_process:
+                if global_step % args.validation_steps == 0:
 
-                    # --- metric validation ---
                     val_metrics = run_validation_metrics(
                         val_dataloader,
                         eeg_backbone,
@@ -1864,28 +2105,27 @@ def main(args):
                         ssfe_projector,
                         diffusion_prior,
                         subject_to_local,
-                        anchor_clip_tokenizer,
-                        anchor_clip_text_model,
                         args,
                         accelerator,
                     )
 
-                    accelerator.log(val_metrics, step=global_step)
+                    if accelerator.is_main_process:
+                        val_metrics["epoch"] = current_epoch
+                        accelerator.log(val_metrics, step=global_step)
 
-                    # --- optional image validation ---
-                    if args.log_validation_images and not args.train_eeg_only:
-                        log_validation(
-                            vae if not args.use_precomputed_latents else None,
-                            text_encoder,
-                            tokenizer,
-                            unet,
-                            controlnet,
-                            args,
-                            accelerator,
-                            weight_dtype,
-                            global_step,
-                            is_final_validation=False,
-                        )
+                        if args.log_validation_images and not args.train_eeg_only:
+                            log_validation(
+                                vae if not args.use_precomputed_latents else None,
+                                text_encoder,
+                                tokenizer,
+                                unet,
+                                controlnet,
+                                args,
+                                accelerator,
+                                weight_dtype,
+                                global_step,
+                                is_final_validation=False,
+                            )
 
                 if global_step % args.checkpointing_steps == 0:
                     final_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
@@ -1908,6 +2148,55 @@ def main(args):
             if global_step >= args.max_train_steps:
                 break
 
+        if accelerator.is_main_process and epoch_logged_steps > 0:
+            epoch_payload = {
+                "epoch_only/epoch": float(epoch + 1),
+                "epoch_only/loss": epoch_loss_sum / epoch_logged_steps,
+                "epoch_only/diffusion_loss": epoch_diffusion_loss_sum / epoch_logged_steps,
+                "epoch_only/lr": epoch_lr_sum / epoch_logged_steps,
+                "epoch_only/E_norm": epoch_e_norm_sum / epoch_logged_steps,
+            }
+
+            if sife is not None:
+                epoch_payload.update({
+                    "epoch_only/loss_subject_inv": epoch_sife_inv_sum / epoch_logged_steps,
+                    "epoch_only/loss_subject_spec": epoch_sife_spec_sum / epoch_logged_steps,
+                    "epoch_only/acc_subject_inv": epoch_inv_acc_sum / epoch_logged_steps,
+                    "epoch_only/acc_subject_spec": epoch_spec_acc_sum / epoch_logged_steps,
+                    "epoch_only/E_i_norm": epoch_ei_norm_sum / epoch_logged_steps,
+                    "epoch_only/E_s_norm": epoch_es_norm_sum / epoch_logged_steps,
+                    "epoch_only/Ei_Es_norm_ratio": epoch_ei_es_ratio_sum / epoch_logged_steps,
+                    "epoch_only/Ei_Es_cos": epoch_ei_es_cos_sum / epoch_logged_steps,
+                    "epoch_only/entropy_subject_inv": epoch_inv_entropy_sum / epoch_logged_steps,
+                    "epoch_only/entropy_subject_spec": epoch_spec_entropy_sum / epoch_logged_steps,
+                    "epoch_only/entropy_subject_inv_norm": epoch_inv_entropy_norm_sum / epoch_logged_steps,
+                    "epoch_only/entropy_subject_spec_norm": epoch_spec_entropy_norm_sum / epoch_logged_steps,
+                    "epoch_only/random_subject_acc": epoch_random_subject_acc_sum / epoch_logged_steps,
+                    "epoch_only/acc_subject_inv_gap_vs_random": epoch_inv_gap_sum / epoch_logged_steps,
+                    "epoch_only/acc_subject_spec_gap_vs_random": epoch_spec_gap_sum / epoch_logged_steps,
+                })
+
+            if recon_decoder is not None:
+                epoch_payload["epoch_only/loss_recon"] = epoch_recon_loss_sum / epoch_logged_steps
+
+            if ssfe_projector is not None:
+                epoch_payload.update({
+                    "epoch_only/loss_ssfe": epoch_ssfe_loss_sum / epoch_logged_steps,
+                    "epoch_only/loss_image_cls": epoch_img_cls_loss_sum / epoch_logged_steps,
+                    "epoch_only/loss_image_dis": epoch_img_dis_loss_sum / epoch_logged_steps,
+                    "epoch_only/acc_image_cls": epoch_img_cls_acc_sum / epoch_logged_steps,
+                    "epoch_only/acc_image_dis": epoch_img_dis_acc_sum / epoch_logged_steps,
+                    "epoch_only/loss_anchor_cls": epoch_anchor_cls_loss_sum / epoch_logged_steps,
+                    "epoch_only/loss_anchor_visual": epoch_anchor_visual_loss_sum / epoch_logged_steps,
+                    "epoch_only/loss_anchor_text": epoch_anchor_text_loss_sum / epoch_logged_steps,
+                    "epoch_only/acc_anchor_cls": epoch_anchor_cls_acc_sum / epoch_logged_steps,
+                })
+
+            if diffusion_prior is not None:
+                epoch_payload["epoch_only/loss_prior"] = epoch_prior_loss_sum / epoch_logged_steps
+
+            accelerator.log(epoch_payload, step=global_step)
+
         if global_step >= args.max_train_steps:
             break
 
@@ -1916,8 +2205,11 @@ def main(args):
     # ---------------------------------------------------------
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        controlnet_unwrapped = accelerator.unwrap_model(controlnet)
-        controlnet_unwrapped.save_pretrained(args.output_dir)
+        controlnet_unwrapped = None
+        if controlnet is not None:
+            controlnet_unwrapped = accelerator.unwrap_model(controlnet)
+            if not args.train_eeg_only:
+                controlnet_unwrapped.save_pretrained(args.output_dir)
 
         eeg_backbone_unwrapped = accelerator.unwrap_model(eeg_backbone)
         torch.save(
@@ -2002,7 +2294,6 @@ def main(args):
                         "lambda_anchor_text": float(args.lambda_anchor_text),
                         "anchor_visual_temperature": float(args.anchor_visual_temperature),
                         "anchor_text_temperature": float(args.anchor_text_temperature),
-                        "anchor_clip_model_name_or_path": args.anchor_clip_model_name_or_path,
                     },
                     f,
                     indent=2,

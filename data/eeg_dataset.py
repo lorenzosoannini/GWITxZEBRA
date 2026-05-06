@@ -1,6 +1,5 @@
 import os
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset
 import numpy as np
 from datasets import load_dataset, concatenate_datasets
@@ -133,12 +132,16 @@ class EEGImageDataset(Dataset):
             clip_embeds_dir/
                 subj1/
                     clip_img_embeds.npy
+                    clip_text_embeds.npy
             or
             clip_embeds_dir/<safe_dataset_name>/subj1/...
 
-        Supported shapes:
+        Supported image shapes:
             pooled:   (N, D)
             sequence: (N, T, D)
+
+        Supported text shapes:
+            pooled:   (N, D)
     """
 
     def __init__(
@@ -178,6 +181,7 @@ class EEGImageDataset(Dataset):
         self.use_precomputed_clip_embeds = bool(use_precomputed_clip_embeds)
         self.clip_embeds_dir = clip_embeds_dir
         self.clip_embed_rank = None  # 2 for pooled, 3 for sequence
+        self.clip_text_embed_dim = None
 
         self.val_ratio = float(val_ratio)
         self.split_seed = int(split_seed)
@@ -241,10 +245,12 @@ class EEGImageDataset(Dataset):
             self.latents_by_subject = {}
 
         self.clip_embeds_by_subject = None
+        self.clip_text_embeds_by_subject = None
         if self.use_precomputed_clip_embeds:
             assert self.clip_embeds_dir is not None, \
                 "You must set clip_embeds_dir if use_precomputed_clip_embeds=True"
             self.clip_embeds_by_subject = {}
+            self.clip_text_embeds_by_subject = {}
 
         # ---------------------------------------------------------
         # Build final dataset subject by subject
@@ -303,8 +309,8 @@ class EEGImageDataset(Dataset):
                 assert os.path.exists(mean_path), f"Missing {mean_path}"
                 assert os.path.exists(logv_path), f"Missing {logv_path}"
 
-                means = np.load(mean_path)
-                logvars = np.load(logv_path)
+                means = np.load(mean_path, mmap_mode="r")
+                logvars = np.load(logv_path, mmap_mode="r")
 
                 assert len(means) == n_subj, (
                     f"Latents length mismatch for subj{subj}: "
@@ -321,40 +327,68 @@ class EEGImageDataset(Dataset):
                 }
 
             # ---------------------------------------------
-            # Load subject CLIP embeds
+            # Load subject CLIP image/text embeds
             # ---------------------------------------------
             if self.use_precomputed_clip_embeds:
                 subj_dir = _resolve_subject_subdir(self.clip_embeds_dir, self.dataset_name, subj)
-                clip_path = os.path.join(subj_dir, "clip_img_embeds.npy")
 
-                assert os.path.exists(clip_path), f"Missing {clip_path}"
+                clip_img_path = os.path.join(subj_dir, "clip_img_embeds.npy")
+                clip_text_path = os.path.join(subj_dir, "clip_text_embeds.npy")
 
-                clip_embeds = np.load(clip_path)
+                assert os.path.exists(clip_img_path), f"Missing {clip_img_path}"
+                assert os.path.exists(clip_text_path), f"Missing {clip_text_path}"
+
+                clip_embeds = np.load(clip_img_path, mmap_mode="r")
+                clip_text_embeds = np.load(clip_text_path, mmap_mode="r")
 
                 assert len(clip_embeds) == n_subj, (
-                    f"CLIP embeds length mismatch for subj{subj}: "
+                    f"CLIP image embeds length mismatch for subj{subj}: "
                     f"{len(clip_embeds)} vs full-pool subject samples {n_subj}"
                 )
 
                 if clip_embeds.ndim not in (2, 3):
                     raise ValueError(
-                        f"Expected CLIP embeds with shape (N, D) or (N, T, D) for subj{subj}, "
+                        f"Expected CLIP image embeds with shape (N, D) or (N, T, D) for subj{subj}, "
                         f"got shape {clip_embeds.shape}"
+                    )
+
+                assert len(clip_text_embeds) == n_subj, (
+                    f"CLIP text embeds length mismatch for subj{subj}: "
+                    f"{len(clip_text_embeds)} vs full-pool subject samples {n_subj}"
+                )
+
+                if clip_text_embeds.ndim != 2:
+                    raise ValueError(
+                        f"Expected CLIP text embeds with shape (N, D) for subj{subj}, "
+                        f"got shape {clip_text_embeds.shape}"
                     )
 
                 if self.clip_embed_rank is None:
                     self.clip_embed_rank = clip_embeds.ndim
                 else:
                     assert self.clip_embed_rank == clip_embeds.ndim, (
-                        f"Inconsistent CLIP embed rank across subjects: "
+                        f"Inconsistent CLIP image embed rank across subjects: "
                         f"previous rank={self.clip_embed_rank}, subj{subj} rank={clip_embeds.ndim}"
                     )
 
+                if self.clip_text_embed_dim is None:
+                    self.clip_text_embed_dim = int(clip_text_embeds.shape[1])
+                else:
+                    assert self.clip_text_embed_dim == int(clip_text_embeds.shape[1]), (
+                        f"Inconsistent CLIP text embed dim across subjects: "
+                        f"previous dim={self.clip_text_embed_dim}, "
+                        f"subj{subj} dim={clip_text_embeds.shape[1]}"
+                    )
+
                 self.clip_embeds_by_subject[subj] = clip_embeds
+                self.clip_text_embeds_by_subject[subj] = clip_text_embeds
 
                 print(
-                    f"[EEG DATASET] Loaded CLIP embeds for subj{subj}: shape={clip_embeds.shape} "
+                    f"[EEG DATASET] Loaded CLIP image embeds for subj{subj}: shape={clip_embeds.shape} "
                     f"| mode={'sequence' if clip_embeds.ndim == 3 else 'pooled'}"
+                )
+                print(
+                    f"[EEG DATASET] Loaded CLIP text embeds for subj{subj}: shape={clip_text_embeds.shape}"
                 )
 
             # ---------------------------------------------
@@ -386,8 +420,11 @@ class EEGImageDataset(Dataset):
 
         if self.use_precomputed_clip_embeds:
             print(
-                f"[EEG DATASET] CLIP embedding mode: "
+                f"[EEG DATASET] CLIP image embedding mode: "
                 f"{'sequence-level' if self.clip_embed_rank == 3 else 'pooled'}"
+            )
+            print(
+                f"[EEG DATASET] CLIP text embedding dim: {self.clip_text_embed_dim}"
             )
 
     def __len__(self):
@@ -402,11 +439,11 @@ class EEGImageDataset(Dataset):
         # ---------------------------------------------------------
         if self.use_precomputed_latents:
             posterior_mean = torch.from_numpy(
-                self.latents_by_subject[subj]["mean"][local_idx]
+                np.asarray(self.latents_by_subject[subj]["mean"][local_idx]).copy()
             ).float()
 
             posterior_logvar = torch.from_numpy(
-                self.latents_by_subject[subj]["logvar"][local_idx]
+                np.asarray(self.latents_by_subject[subj]["logvar"][local_idx]).copy()
             ).float()
 
             img = None
@@ -421,12 +458,23 @@ class EEGImageDataset(Dataset):
         clip_img_embeds = None
         if self.use_precomputed_clip_embeds:
             clip_img_embeds = torch.from_numpy(
-                self.clip_embeds_by_subject[subj][local_idx]
+                np.asarray(self.clip_embeds_by_subject[subj][local_idx]).copy()
             ).float()
 
+            # IMPORTANTE:
+            # per il prior e per unCLIP servono i raw CLIP image tokens,
+            # quindi qui NON normalizziamo.
             # pooled  -> (D)
             # seq-lvl -> (T, D)
-            clip_img_embeds = F.normalize(clip_img_embeds, dim=-1)
+
+        # ---------------------------------------------------------
+        # Optional CLIP text embedding
+        # ---------------------------------------------------------
+        clip_text_embeds = None
+        if self.use_precomputed_clip_embeds:
+            clip_text_embeds = torch.from_numpy(
+                np.asarray(self.clip_text_embeds_by_subject[subj][local_idx]).copy()
+            ).float()
 
         # ---------------------------------------------------------
         # EEG conditioning map (C,T)
@@ -483,6 +531,7 @@ class EEGImageDataset(Dataset):
 
         if self.use_precomputed_clip_embeds:
             out["clip_img_embeds"] = clip_img_embeds
+            out["clip_text_embeds"] = clip_text_embeds
 
         return out
 

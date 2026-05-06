@@ -1,4 +1,4 @@
-import torch
+import torch.nn as nn
 from torch.autograd import Function
 
 
@@ -13,7 +13,7 @@ class GradientReversalFunction(Function):
         return -ctx.lambda_ * grad_output, None
 
 
-class GRL(torch.nn.Module):
+class GRL(nn.Module):
     def __init__(self, lambda_=1.0):
         super().__init__()
         self.lambda_ = lambda_
