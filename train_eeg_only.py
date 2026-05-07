@@ -535,6 +535,11 @@ def parse_args(input_args=None):
     parser.add_argument("--load_recon_path", type=str, default=None)
     parser.add_argument("--load_ssfe_path", type=str, default=None)
     parser.add_argument("--load_prior_path", type=str, default=None)
+    
+    # Initialize SSFE.general_projector from the stage-1 CLIP pretraining projector.
+    # This maps:
+    #   PretrainCLIPProjector.projector -> SSFEProjector.general_projector
+    parser.add_argument("--init_general_projector_from_stage1", type=str, default=None)
 
     args = parser.parse_args(input_args)
 
@@ -552,6 +557,15 @@ def parse_args(input_args=None):
 
     if args.use_stage1_clip_pretrain and args.training_stage not in {"stage1", "full"}:
         raise ValueError("--use_stage1_clip_pretrain is intended for stage1 or full training")
+    if args.load_ssfe_path is not None and args.init_general_projector_from_stage1 is not None:
+        raise ValueError(
+            "Use either --load_ssfe_path or --init_general_projector_from_stage1, not both. "
+            "--load_ssfe_path loads a full SSFE checkpoint; "
+            "--init_general_projector_from_stage1 initializes only SSFE.general_projector."
+        )
+
+    if args.init_general_projector_from_stage1 is not None and not args.use_ssfe:
+        raise ValueError("--init_general_projector_from_stage1 requires --use_ssfe")
     if (
         args.lambda_anchor_cls > 0.0
         or args.lambda_anchor_visual > 0.0
@@ -893,6 +907,40 @@ def main(args):
         if args.load_ssfe_path is not None:
             ssfe_projector.load_state_dict(torch.load(args.load_ssfe_path, map_location="cpu"))
             accelerator.print(f"[LOAD] Loaded SSFE from {args.load_ssfe_path}")
+
+        if args.init_general_projector_from_stage1 is not None:
+            stage1_state = torch.load(
+                args.init_general_projector_from_stage1,
+                map_location="cpu",
+            )
+
+            # Saved PretrainCLIPProjector has keys like:
+            #   projector.bottleneck...
+            #   projector.broadcaster...
+            #
+            # SSFEProjector.general_projector expects:
+            #   bottleneck...
+            #   broadcaster...
+            if any(k.startswith("projector.") for k in stage1_state.keys()):
+                general_state = {
+                    k.replace("projector.", "", 1): v
+                    for k, v in stage1_state.items()
+                    if k.startswith("projector.")
+                }
+            else:
+                general_state = stage1_state
+
+            missing, unexpected = ssfe_projector.general_projector.load_state_dict(
+                general_state,
+                strict=True,
+            )
+
+            accelerator.print(
+                "[LOAD] Initialized SSFE general_projector from stage1 CLIP projector\n"
+                f"       source={args.init_general_projector_from_stage1}\n"
+                f"       missing={missing}\n"
+                f"       unexpected={unexpected}"
+            )
 
     diffusion_prior = None
     prior_dim = None
@@ -1683,6 +1731,7 @@ def main(args):
                     "lambda_anchor_text": float(args.lambda_anchor_text),
                     "anchor_visual_temperature": float(args.anchor_visual_temperature),
                     "anchor_text_temperature": float(args.anchor_text_temperature),
+                    "init_general_projector_from_stage1": args.init_general_projector_from_stage1,
                 },
             )
 
