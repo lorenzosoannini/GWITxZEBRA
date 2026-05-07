@@ -433,7 +433,12 @@ def parse_args(input_args=None):
     parser.add_argument("--gradient_checkpointing_prior", action="store_true")
 
     # Staged training
-    parser.add_argument("--training_stage", type=str, default="full", choices=["full", "stage1", "stage2", "stage3"])
+    parser.add_argument(
+        "--training_stage",
+        type=str,
+        default="full",
+        choices=["full", "stage1", "stage2", "stage2_joint", "stage3"],
+    )
     parser.add_argument("--load_sife_path", type=str, default=None)
     parser.add_argument("--load_recon_path", type=str, default=None)
     parser.add_argument("--load_ssfe_path", type=str, default=None)
@@ -468,6 +473,20 @@ def parse_args(input_args=None):
             raise ValueError("stage2 requires --load_sife_path")
         if args.eeg_backbone_ckpt is None:
             raise ValueError("stage2 requires --eeg_backbone_ckpt")
+        
+    if args.training_stage == "stage2_joint":
+        if not args.use_sife:
+            raise ValueError("stage2_joint requires --use_sife")
+        if not args.use_ssfe:
+            raise ValueError("stage2_joint requires --use_ssfe")
+        if not args.use_prior:
+            raise ValueError("stage2_joint requires --use_prior")
+        if not args.use_precomputed_clip_embeds:
+            raise ValueError("stage2_joint requires --use_precomputed_clip_embeds")
+        if args.load_sife_path is None:
+            raise ValueError("stage2_joint requires --load_sife_path")
+        if args.eeg_backbone_ckpt is None:
+            raise ValueError("stage2_joint requires --eeg_backbone_ckpt")
 
     if args.training_stage == "stage3":
         if not args.use_sife or not args.use_ssfe or not args.use_prior:
@@ -803,6 +822,7 @@ def main(args):
 
     is_stage1 = args.training_stage == "stage1"
     is_stage2 = args.training_stage == "stage2"
+    is_stage2_joint = args.training_stage == "stage2_joint"
     is_stage3 = args.training_stage == "stage3"
     is_full = args.training_stage == "full"
 
@@ -818,6 +838,12 @@ def main(args):
         set_trainable(recon_decoder, False)
         set_trainable(ssfe_projector, True)
         set_trainable(diffusion_prior, False)
+    elif is_stage2_joint:
+        set_trainable(eeg_backbone, False)
+        set_trainable(sife, False)
+        set_trainable(recon_decoder, False)
+        set_trainable(ssfe_projector, True)
+        set_trainable(diffusion_prior, True)
     elif is_stage3:
         set_trainable(eeg_backbone, False)
         set_trainable(sife, False)
@@ -999,7 +1025,7 @@ def main(args):
                 eeg_cond = batch["conditioning_pixel_values"].to(accelerator.device, dtype=torch.float32)
                 image_labels = batch["image_labels"].to(accelerator.device, dtype=torch.long)
 
-                if is_stage2 or is_stage3:
+                if is_stage2 or is_stage2_joint or is_stage3:
                     with torch.no_grad():
                         eeg_feats = eeg_backbone(eeg_cond.float())
                         E_seq = eeg_feats["sequence"]
@@ -1111,7 +1137,7 @@ def main(args):
                     else:
                         raise ValueError(f"Unsupported recon_loss_type: {args.recon_loss_type}")
 
-                if ssfe_projector is not None and (is_stage2 or is_full):
+                if ssfe_projector is not None and (is_stage2 or is_stage2_joint or is_full):
                     if E_i_seq is None:
                         raise RuntimeError("SSFE requires E_i_seq from SIFE.")
 
@@ -1191,7 +1217,7 @@ def main(args):
                     with torch.no_grad():
                         F_s = ssfe_projector(E_i=E_i_seq.float(), E=E_seq.float())["F_s"]
 
-                if diffusion_prior is not None and (is_stage3 or is_full):
+                if diffusion_prior is not None and (is_stage3 or is_stage2_joint or is_full):
                     if F_s is None:
                         raise RuntimeError("Prior requires F_s from SSFE.")
 
@@ -1227,10 +1253,10 @@ def main(args):
                 if recon_decoder is not None and (is_stage1 or is_full):
                     loss_total = loss_total + float(args.lambda_recon) * recon_loss
 
-                if ssfe_projector is not None and (is_stage2 or is_full):
+                if ssfe_projector is not None and (is_stage2 or is_stage2_joint or is_full):
                     loss_total = loss_total + float(args.lambda_ssfe) * ssfe_loss
 
-                if diffusion_prior is not None and (is_stage3 or is_full):
+                if diffusion_prior is not None and (is_stage3 or is_stage2_joint or is_full):
                     loss_total = loss_total + float(args.lambda_prior) * prior_loss
 
                 accelerator.backward(loss_total)
