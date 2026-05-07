@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch import einsum
+from torch.utils.checkpoint import checkpoint
 
 
 # ---------------------------------------------------------
@@ -284,6 +285,7 @@ class FlaggedCausalTransformer(nn.Module):
         causal=True,
     ):
         super().__init__()
+        self.gradient_checkpointing = False
         self.init_norm = LayerNorm(dim) if norm_in else nn.Identity()
         self.rel_pos_bias = RelPosBias(heads=heads)
 
@@ -312,6 +314,9 @@ class FlaggedCausalTransformer(nn.Module):
         self.norm = LayerNorm(dim, stable=True) if norm_out else nn.Identity()
         self.project_out = nn.Linear(dim, dim, bias=False) if final_proj else nn.Identity()
 
+    def set_gradient_checkpointing(self, enabled: bool = True):
+        self.gradient_checkpointing = bool(enabled)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         n, device = x.shape[1], x.device
 
@@ -319,8 +324,18 @@ class FlaggedCausalTransformer(nn.Module):
         attn_bias = self.rel_pos_bias(n, n + 1, device=device)
 
         for attn, ff in self.layers:
-            x = attn(x, attn_bias=attn_bias) + x
-            x = ff(x) + x
+            if self.gradient_checkpointing and self.training:
+                def attn_forward(x, attn=attn, attn_bias=attn_bias):
+                    return attn(x, attn_bias=attn_bias)
+
+                def ff_forward(x, ff=ff):
+                    return ff(x)
+
+                x = checkpoint(attn_forward, x, use_reentrant=False) + x
+                x = checkpoint(ff_forward, x, use_reentrant=False) + x
+            else:
+                x = attn(x, attn_bias=attn_bias) + x
+                x = ff(x) + x
 
         out = self.norm(x)
         return self.project_out(out)
@@ -523,6 +538,9 @@ class PriorNetwork(nn.Module):
 
         self.num_tokens = num_tokens
         self.self_cond = False
+
+    def set_gradient_checkpointing(self, enabled: bool = True):
+        self.causal_transformer.set_gradient_checkpointing(enabled)
 
     def forward_with_cond_scale(
         self,
