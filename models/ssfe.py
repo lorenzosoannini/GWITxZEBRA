@@ -223,7 +223,6 @@ class _SimpleSequenceAdapter(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = _maybe_resize_tokens(x, self.target_tokens)
         y = self.token_mlp(x)
-        y = F.normalize(y, dim=-1)
         return y
 
 
@@ -383,7 +382,6 @@ class _ZebraLikeSequenceAdapter(nn.Module):
         x = _maybe_resize_tokens(x, self.target_tokens)
         x = self.bottleneck(x)
         x = self.broadcaster(x)
-        x = F.normalize(x, dim=-1)
         return x
 
 
@@ -416,6 +414,65 @@ def _build_sequence_adapter(
 
     raise ValueError(f"Unsupported adapter_type: {adapter_type}")
 
+# ---------------------------------------------------------
+# STAGE-1 CLIP PRETRAIN PROJECTOR
+# ---------------------------------------------------------
+class PretrainCLIPProjector(nn.Module):
+    """
+    ZEBRA-like pretraining projector.
+
+    Purpose:
+        During stage1, align the generic EEG sequence representation E_seq
+        directly to CLIP image tokens.
+
+    ZEBRA counterpart:
+        clip_embed_all = self.to_clip(brain_embed)
+
+    Input:
+        E_seq: (B, T_eeg, D_eeg)
+
+    Output:
+        clip_pred: (B, target_tokens, out_dim)
+    """
+
+    def __init__(
+        self,
+        in_dim: int = 128,
+        hidden_dim: int = 256,
+        out_dim: int = 1664,
+        target_tokens: int = 256,
+        adapter_type: str = "zebra_like",
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        self.in_dim = int(in_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.out_dim = int(out_dim)
+        self.target_tokens = int(target_tokens)
+        self.adapter_type = adapter_type
+
+        self.projector = _build_sequence_adapter(
+            adapter_type=adapter_type,
+            in_dim=self.in_dim,
+            hidden_dim=self.hidden_dim,
+            out_dim=self.out_dim,
+            target_tokens=self.target_tokens,
+            dropout=dropout,
+        )
+
+    def set_gradient_checkpointing(self, enable: bool = True):
+        if hasattr(self.projector, "set_gradient_checkpointing"):
+            self.projector.set_gradient_checkpointing(enable)
+
+    def forward(self, E_seq: torch.Tensor) -> torch.Tensor:
+        if E_seq.ndim != 3:
+            raise ValueError(
+                f"PretrainCLIPProjector expects E_seq with shape (B, T, D), "
+                f"got {tuple(E_seq.shape)}"
+            )
+
+        return self.projector(E_seq)
 
 # ---------------------------------------------------------
 # CLASSIFIERS / PROJECTORS
@@ -496,7 +553,6 @@ class AnchorTextProjector(nn.Module):
 
         x = torch.mean(x, dim=1)   # (B, in_dim)
         x = x @ self.proj          # (B, out_dim)
-        x = F.normalize(x, dim=-1)
         return x
 
 

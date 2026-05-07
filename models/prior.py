@@ -682,6 +682,7 @@ class BrainDiffusionPrior(nn.Module):
         training_clamp_l2norm=False,
         init_image_embed_l2norm=False,
         image_embed_scale=None,
+        use_image_embed_scale: bool = False,
     ):
         super().__init__()
 
@@ -708,7 +709,12 @@ class BrainDiffusionPrior(nn.Module):
         self.predict_x_start = predict_x_start
         self.predict_v = predict_v
 
-        self.image_embed_scale = default(image_embed_scale, self.image_embed_dim ** 0.5)
+        self.use_image_embed_scale = bool(use_image_embed_scale)
+
+        if self.use_image_embed_scale:
+            self.image_embed_scale = default(image_embed_scale, self.image_embed_dim ** 0.5)
+        else:
+            self.image_embed_scale = 1.0
 
         self.sampling_clamp_l2norm = sampling_clamp_l2norm
         self.sampling_final_clamp_l2norm = sampling_final_clamp_l2norm
@@ -945,13 +951,18 @@ class BrainDiffusionPrior(nn.Module):
                 cond_scale=cond_scale,
             )
 
-        image_embed = normalized_image_embed / self.image_embed_scale
+        if self.use_image_embed_scale:
+            image_embed = normalized_image_embed / self.image_embed_scale
+        else:
+            image_embed = normalized_image_embed
+
         return image_embed
 
     def p_losses(self, image_embed, times, text_cond, noise=None):
         noise = default(noise, lambda: torch.randn_like(image_embed))
 
         image_embed_scaled = image_embed * self.image_embed_scale
+
         image_embed_noisy = self.noise_scheduler.q_sample(
             x_start=image_embed_scaled,
             t=times,

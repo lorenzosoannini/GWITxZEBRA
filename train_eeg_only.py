@@ -24,6 +24,7 @@ from models.sife import SIFE
 from models.eeg_reconstruction import EEGReconstructionDecoder
 from models.ssfe import (
     SSFEProjector,
+    PretrainCLIPProjector,
     multi_positive_info_nce_loss,
     multi_positive_sequence_info_nce_loss,
 )
@@ -84,6 +85,7 @@ def run_validation_metrics(
     eeg_backbone,
     sife,
     recon_decoder,
+    stage1_clip_projector,
     ssfe_projector,
     diffusion_prior,
     subject_to_local,
@@ -94,6 +96,7 @@ def run_validation_metrics(
         "eeg_backbone": eeg_backbone.training,
         "sife": sife.training if sife is not None else None,
         "recon_decoder": recon_decoder.training if recon_decoder is not None else None,
+        "stage1_clip_projector": stage1_clip_projector.training if stage1_clip_projector is not None else None,
         "ssfe_projector": ssfe_projector.training if ssfe_projector is not None else None,
         "diffusion_prior": diffusion_prior.training if diffusion_prior is not None else None,
     }
@@ -103,6 +106,8 @@ def run_validation_metrics(
         sife.eval()
     if recon_decoder is not None:
         recon_decoder.eval()
+    if stage1_clip_projector is not None:
+        stage1_clip_projector.eval()
     if ssfe_projector is not None:
         ssfe_projector.eval()
     if diffusion_prior is not None:
@@ -120,14 +125,18 @@ def run_validation_metrics(
         "Ei_Es_norm_ratio",
         "Ei_Es_cos",
         "loss_recon",
+        "stage1_clip_loss",
+        "stage1_clip_top1",
         "loss_image_cls",
         "loss_image_dis",
         "acc_image_cls",
         "acc_image_dis",
         "anchor_cls_loss",
         "anchor_visual_loss",
+        "anchor_visual_s_loss",
         "loss_anchor_text",
         "anchor_top1",
+        "anchor_s_top1",
         "prior_loss",
     ]
     acc = {name: torch.tensor(0.0, device=device) for name in names}
@@ -192,6 +201,38 @@ def run_validation_metrics(
 
                 acc["loss_recon"] += loss_recon * bsz_t
 
+            if getattr(args, "use_stage1_clip_pretrain", False):
+                if stage1_clip_projector is None:
+                    raise RuntimeError("Validation requested stage1 clip pretrain but projector is None.")
+
+                clip_target = batch["clip_img_embeds"].to(device, dtype=torch.float32)
+                visual_group_ids = get_group_ids_from_batch(batch, "visual_group_ids", device)
+
+                stage1_clip_pred = stage1_clip_projector(E_seq.float())
+
+                loss_stage1_clip = multi_positive_sequence_info_nce_loss(
+                    stage1_clip_pred.float(),
+                    clip_target.float(),
+                    group_ids=visual_group_ids,
+                    temperature=args.stage1_clip_temperature,
+                    exclude_self=False,
+                )
+
+                acc["stage1_clip_loss"] += loss_stage1_clip * bsz_t
+
+                pred_flat = F.normalize(
+                    stage1_clip_pred.float().reshape(stage1_clip_pred.shape[0], -1),
+                    dim=-1,
+                )
+                tgt_flat = F.normalize(
+                    clip_target.float().reshape(clip_target.shape[0], -1),
+                    dim=-1,
+                )
+                sim = pred_flat @ tgt_flat.t()
+                top1_group = visual_group_ids[sim.argmax(dim=1)]
+                top1 = (top1_group == visual_group_ids).float().mean()
+                acc["stage1_clip_top1"] += top1 * bsz_t
+
             if ssfe_projector is not None:
                 if E_i_seq is None:
                     raise RuntimeError("Validation SSFE requires E_i_seq from SIFE.")
@@ -217,31 +258,55 @@ def run_validation_metrics(
                 acc["acc_image_cls"] += acc_image_cls * bsz_t
                 acc["acc_image_dis"] += acc_image_dis * bsz_t
 
-                if args.lambda_anchor_visual > 0.0:
+                if args.lambda_anchor_visual > 0.0 or args.lambda_anchor_visual_s > 0.0:
                     visual_group_ids = get_group_ids_from_batch(batch, "visual_group_ids", device)
                     clip_target = batch["clip_img_embeds"].to(device, dtype=torch.float32)
 
-                    loss_anchor_visual = multi_positive_sequence_info_nce_loss(
-                        F_anchor_visual.float(),
-                        clip_target.float(),
-                        group_ids=visual_group_ids,
-                        temperature=args.anchor_visual_temperature,
-                        exclude_self=False,
-                    )
-                    acc["anchor_visual_loss"] += loss_anchor_visual * bsz_t
+                    if args.lambda_anchor_visual > 0.0:
+                        loss_anchor_visual = multi_positive_sequence_info_nce_loss(
+                            F_anchor_visual.float(),
+                            clip_target.float(),
+                            group_ids=visual_group_ids,
+                            temperature=args.anchor_visual_temperature,
+                            exclude_self=False,
+                        )
+                        acc["anchor_visual_loss"] += loss_anchor_visual * bsz_t
 
-                    pred_flat = F.normalize(
-                        F_anchor_visual.float().reshape(F_anchor_visual.shape[0], -1),
-                        dim=-1,
-                    )
-                    tgt_flat = F.normalize(
-                        clip_target.float().reshape(clip_target.shape[0], -1),
-                        dim=-1,
-                    )
-                    sim = pred_flat @ tgt_flat.t()
-                    top1_group = visual_group_ids[sim.argmax(dim=1)]
-                    top1 = (top1_group == visual_group_ids).float().mean()
-                    acc["anchor_top1"] += top1 * bsz_t
+                        pred_flat = F.normalize(
+                            F_anchor_visual.float().reshape(F_anchor_visual.shape[0], -1),
+                            dim=-1,
+                        )
+                        tgt_flat = F.normalize(
+                            clip_target.float().reshape(clip_target.shape[0], -1),
+                            dim=-1,
+                        )
+                        sim = pred_flat @ tgt_flat.t()
+                        top1_group = visual_group_ids[sim.argmax(dim=1)]
+                        top1 = (top1_group == visual_group_ids).float().mean()
+                        acc["anchor_top1"] += top1 * bsz_t
+
+                    if args.lambda_anchor_visual_s > 0.0:
+                        loss_anchor_visual_s = multi_positive_sequence_info_nce_loss(
+                            F_s.float(),
+                            clip_target.float(),
+                            group_ids=visual_group_ids,
+                            temperature=args.anchor_visual_temperature,
+                            exclude_self=False,
+                        )
+                        acc["anchor_visual_s_loss"] += loss_anchor_visual_s * bsz_t
+
+                        pred_s_flat = F.normalize(
+                            F_s.float().reshape(F_s.shape[0], -1),
+                            dim=-1,
+                        )
+                        tgt_flat_s = F.normalize(
+                            clip_target.float().reshape(clip_target.shape[0], -1),
+                            dim=-1,
+                        )
+                        sim_s = pred_s_flat @ tgt_flat_s.t()
+                        top1_s_group = visual_group_ids[sim_s.argmax(dim=1)]
+                        top1_s = (top1_s_group == visual_group_ids).float().mean()
+                        acc["anchor_s_top1"] += top1_s * bsz_t
 
                 if args.lambda_anchor_text > 0.0:
                     text_group_ids = get_group_ids_from_batch(batch, "text_group_ids", device)
@@ -283,24 +348,33 @@ def run_validation_metrics(
         "val/Ei_Es_norm_ratio": (summed[7] / total_global).item(),
         "val/Ei_Es_cos": (summed[8] / total_global).item(),
         "val/loss_recon": (summed[9] / total_global).item(),
-        "val/loss_image_cls": (summed[10] / total_global).item(),
-        "val/loss_image_dis": (summed[11] / total_global).item(),
-        "val/acc_image_cls": (summed[12] / total_global).item(),
-        "val/acc_image_dis": (summed[13] / total_global).item(),
-        "val/anchor_cls_loss": (summed[14] / total_global).item(),
-        "val/anchor_visual_loss": (summed[15] / total_global).item(),
-        "val/loss_anchor_text": (summed[16] / total_global).item(),
-        "val/anchor_top1": (summed[17] / total_global).item(),
+
+        "val/stage1_clip_loss": (summed[10] / total_global).item(),
+        "val/stage1_clip_top1": (summed[11] / total_global).item(),
+
+        "val/loss_image_cls": (summed[12] / total_global).item(),
+        "val/loss_image_dis": (summed[13] / total_global).item(),
+        "val/acc_image_cls": (summed[14] / total_global).item(),
+        "val/acc_image_dis": (summed[15] / total_global).item(),
+
+        "val/anchor_cls_loss": (summed[16] / total_global).item(),
+        "val/anchor_visual_loss": (summed[17] / total_global).item(),
+        "val/anchor_visual_s_loss": (summed[18] / total_global).item(),
+        "val/loss_anchor_text": (summed[19] / total_global).item(),
+        "val/anchor_top1": (summed[20] / total_global).item(),
+        "val/anchor_s_top1": (summed[21] / total_global).item(),
     }
 
     if diffusion_prior is not None:
-        metrics["val/prior_loss"] = (summed[18] / total_global).item()
+        metrics["val/prior_loss"] = (summed[22] / total_global).item()
 
     eeg_backbone.train(previous_modes["eeg_backbone"])
     if sife is not None:
         sife.train(previous_modes["sife"])
     if recon_decoder is not None:
         recon_decoder.train(previous_modes["recon_decoder"])
+    if stage1_clip_projector is not None:
+        stage1_clip_projector.train(previous_modes["stage1_clip_projector"])
     if ssfe_projector is not None:
         ssfe_projector.train(previous_modes["ssfe_projector"])
     if diffusion_prior is not None:
@@ -401,6 +475,23 @@ def parse_args(input_args=None):
     parser.add_argument("--lambda_recon", type=float, default=1.0)
     parser.add_argument("--recon_loss_type", type=str, default="l1", choices=["mse", "smooth_l1", "l1"])
 
+    # Stage-1 CLIP visual pretraining
+    parser.add_argument("--use_stage1_clip_pretrain", action="store_true")
+    parser.add_argument("--stage1_clip_hidden_dim", type=int, default=256)
+    parser.add_argument("--stage1_clip_out_dim", type=int, default=1664)
+    parser.add_argument("--stage1_clip_target_tokens", type=int, default=256)
+    parser.add_argument(
+        "--stage1_clip_adapter_type",
+        type=str,
+        default="zebra_like",
+        choices=["simple", "zebra_like"],
+    )
+    parser.add_argument("--stage1_clip_lr", type=float, default=None)
+    parser.add_argument("--lambda_stage1_clip", type=float, default=1.0)
+    parser.add_argument("--stage1_clip_temperature", type=float, default=0.07)
+    parser.add_argument("--gradient_checkpointing_stage1_clip", action="store_true")
+    parser.add_argument("--load_stage1_clip_projector_path", type=str, default=None)
+
     # SSFE
     parser.add_argument("--use_ssfe", action="store_true")
     parser.add_argument("--ssfe_hidden_dim", type=int, default=256)
@@ -417,6 +508,7 @@ def parse_args(input_args=None):
     # Anchor losses
     parser.add_argument("--lambda_anchor_cls", type=float, default=0.0)
     parser.add_argument("--lambda_anchor_visual", type=float, default=0.0)
+    parser.add_argument("--lambda_anchor_visual_s", type=float, default=0.0)
     parser.add_argument("--lambda_anchor_text", type=float, default=0.0)
     parser.add_argument("--anchor_visual_temperature", type=float, default=0.07)
     parser.add_argument("--anchor_text_temperature", type=float, default=0.07)
@@ -455,14 +547,23 @@ def parse_args(input_args=None):
         raise ValueError("--use_prior requires --use_ssfe")
     if args.use_prior and not args.use_precomputed_clip_embeds:
         raise ValueError("--use_prior requires --use_precomputed_clip_embeds")
+    if args.use_stage1_clip_pretrain and not args.use_precomputed_clip_embeds:
+        raise ValueError("--use_stage1_clip_pretrain requires --use_precomputed_clip_embeds")
+
+    if args.use_stage1_clip_pretrain and args.training_stage not in {"stage1", "full"}:
+        raise ValueError("--use_stage1_clip_pretrain is intended for stage1 or full training")
     if (
         args.lambda_anchor_cls > 0.0
         or args.lambda_anchor_visual > 0.0
+        or args.lambda_anchor_visual_s > 0.0
         or args.lambda_anchor_text > 0.0
     ) and not args.use_ssfe:
         raise ValueError("Anchor losses require --use_ssfe")
-    if args.lambda_anchor_visual > 0.0 and not args.use_precomputed_clip_embeds:
-        raise ValueError("--lambda_anchor_visual requires --use_precomputed_clip_embeds")
+    if (
+        args.lambda_anchor_visual > 0.0
+        or args.lambda_anchor_visual_s > 0.0
+    ) and not args.use_precomputed_clip_embeds:
+        raise ValueError("--lambda_anchor_visual / --lambda_anchor_visual_s require --use_precomputed_clip_embeds")
     if args.lambda_anchor_text > 0.0 and not args.use_precomputed_clip_embeds:
         raise ValueError("--lambda_anchor_text requires --use_precomputed_clip_embeds")
 
@@ -579,7 +680,7 @@ def infer_clip_dims_from_dataset(train_dataset, args, accelerator):
     inferred_tokens = None
     inferred_clip_dim = None
 
-    if args.use_ssfe or args.use_prior:
+    if args.use_ssfe or args.use_prior or args.use_stage1_clip_pretrain:
         if not args.use_precomputed_clip_embeds:
             raise ValueError("--use_ssfe/--use_prior requires --use_precomputed_clip_embeds")
 
@@ -597,16 +698,29 @@ def infer_clip_dims_from_dataset(train_dataset, args, accelerator):
 
         inferred_tokens, inferred_clip_dim = clip_ex.shape
 
-        if args.ssfe_target_tokens != inferred_tokens:
-            raise ValueError(
-                f"ssfe_target_tokens={args.ssfe_target_tokens}, "
-                f"but dataset tokens={inferred_tokens}"
-            )
-        if args.ssfe_out_dim != inferred_clip_dim:
-            raise ValueError(
-                f"ssfe_out_dim={args.ssfe_out_dim}, "
-                f"but dataset dim={inferred_clip_dim}"
-            )
+        if args.use_ssfe or args.use_prior:
+            if args.ssfe_target_tokens != inferred_tokens:
+                raise ValueError(
+                    f"ssfe_target_tokens={args.ssfe_target_tokens}, "
+                    f"but dataset tokens={inferred_tokens}"
+                )
+            if args.ssfe_out_dim != inferred_clip_dim:
+                raise ValueError(
+                    f"ssfe_out_dim={args.ssfe_out_dim}, "
+                    f"but dataset dim={inferred_clip_dim}"
+                )
+
+        if args.use_stage1_clip_pretrain:
+            if args.stage1_clip_target_tokens != inferred_tokens:
+                raise ValueError(
+                    f"stage1_clip_target_tokens={args.stage1_clip_target_tokens}, "
+                    f"but dataset tokens={inferred_tokens}"
+                )
+            if args.stage1_clip_out_dim != inferred_clip_dim:
+                raise ValueError(
+                    f"stage1_clip_out_dim={args.stage1_clip_out_dim}, "
+                    f"but dataset dim={inferred_clip_dim}"
+                )
 
         if "clip_text_embeds" in first_ex:
             anchor_text_dim = int(first_ex["clip_text_embeds"].shape[0])
@@ -737,6 +851,28 @@ def main(args):
         accelerator=accelerator,
     )
 
+    stage1_clip_projector = None
+    if args.use_stage1_clip_pretrain:
+        stage1_clip_projector = PretrainCLIPProjector(
+            in_dim=args.eeg_backbone_hidden_size,
+            hidden_dim=args.stage1_clip_hidden_dim,
+            out_dim=args.stage1_clip_out_dim,
+            target_tokens=args.stage1_clip_target_tokens,
+            adapter_type=args.stage1_clip_adapter_type,
+        )
+
+        if args.gradient_checkpointing_stage1_clip:
+            stage1_clip_projector.set_gradient_checkpointing(True)
+            accelerator.print("[STAGE1 CLIP] gradient checkpointing enabled")
+
+        if args.load_stage1_clip_projector_path is not None:
+            stage1_clip_projector.load_state_dict(
+                torch.load(args.load_stage1_clip_projector_path, map_location="cpu")
+            )
+            accelerator.print(
+                f"[LOAD] Loaded stage1 CLIP projector from {args.load_stage1_clip_projector_path}"
+            )
+
     ssfe_projector = None
     if args.use_ssfe:
         ssfe_projector = SSFEProjector(
@@ -814,6 +950,7 @@ def main(args):
             predict_x_start=True,
             training_clamp_l2norm=False,
             sampling_clamp_l2norm=False,
+            use_image_embed_scale=False,
         )
 
         if args.load_prior_path is not None:
@@ -830,30 +967,35 @@ def main(args):
         set_trainable(eeg_backbone, True)
         set_trainable(sife, True)
         set_trainable(recon_decoder, True)
+        set_trainable(stage1_clip_projector, True)
         set_trainable(ssfe_projector, False)
         set_trainable(diffusion_prior, False)
     elif is_stage2:
         set_trainable(eeg_backbone, False)
         set_trainable(sife, False)
         set_trainable(recon_decoder, False)
+        set_trainable(stage1_clip_projector, False)
         set_trainable(ssfe_projector, True)
         set_trainable(diffusion_prior, False)
     elif is_stage2_joint:
         set_trainable(eeg_backbone, False)
         set_trainable(sife, False)
         set_trainable(recon_decoder, False)
+        set_trainable(stage1_clip_projector, False)
         set_trainable(ssfe_projector, True)
         set_trainable(diffusion_prior, True)
     elif is_stage3:
         set_trainable(eeg_backbone, False)
         set_trainable(sife, False)
         set_trainable(recon_decoder, False)
+        set_trainable(stage1_clip_projector, False)
         set_trainable(ssfe_projector, False)
         set_trainable(diffusion_prior, True)
     else:
         set_trainable(eeg_backbone, True)
         set_trainable(sife, True)
         set_trainable(recon_decoder, True)
+        set_trainable(stage1_clip_projector, True)
         set_trainable(ssfe_projector, True)
         set_trainable(diffusion_prior, True)
 
@@ -861,6 +1003,7 @@ def main(args):
     lr_eeg = float(args.eeg_backbone_lr) if args.eeg_backbone_lr is not None else lr_main
     lr_sife = float(args.sife_lr) if args.sife_lr is not None else lr_main
     lr_recon = float(args.recon_lr) if args.recon_lr is not None else lr_main
+    lr_stage1_clip = float(args.stage1_clip_lr) if args.stage1_clip_lr is not None else lr_main
     lr_ssfe = float(args.ssfe_lr) if args.ssfe_lr is not None else lr_main
     lr_prior = float(args.prior_lr) if args.prior_lr is not None else lr_main
 
@@ -868,6 +1011,7 @@ def main(args):
         ("eeg", eeg_backbone, lr_eeg),
         ("sife", sife, lr_sife),
         ("recon", recon_decoder, lr_recon),
+        ("stage1_clip", stage1_clip_projector, lr_stage1_clip),
         ("ssfe", ssfe_projector, lr_ssfe),
         ("prior", diffusion_prior, lr_prior),
     ]
@@ -910,6 +1054,8 @@ def main(args):
         prepare_items.append(sife)
     if recon_decoder is not None:
         prepare_items.append(recon_decoder)
+    if stage1_clip_projector is not None:
+        prepare_items.append(stage1_clip_projector)
     if ssfe_projector is not None:
         prepare_items.append(ssfe_projector)
     if diffusion_prior is not None:
@@ -927,6 +1073,9 @@ def main(args):
     if recon_decoder is not None:
         recon_decoder = prepared[idx]
         idx += 1
+    if stage1_clip_projector is not None:
+        stage1_clip_projector = prepared[idx]
+        idx += 1
     if ssfe_projector is not None:
         ssfe_projector = prepared[idx]
         idx += 1
@@ -942,7 +1091,7 @@ def main(args):
     lr_scheduler = prepared[idx]
 
     accum_models = []
-    for module in [eeg_backbone, sife, recon_decoder, ssfe_projector, diffusion_prior]:
+    for module in [eeg_backbone, sife, recon_decoder, stage1_clip_projector, ssfe_projector, diffusion_prior]:
         if module is not None and any(p.requires_grad for p in module.parameters()):
             accum_models.append(module)
 
@@ -984,7 +1133,7 @@ def main(args):
         )
 
     # Keep trainable EEG modules in fp32. Mixed precision is still handled by Accelerator.
-    for module in [eeg_backbone, sife, recon_decoder, ssfe_projector, diffusion_prior]:
+    for module in [eeg_backbone, sife, recon_decoder, stage1_clip_projector, ssfe_projector, diffusion_prior]:
         if module is not None:
             module.to(accelerator.device, dtype=torch.float32)
 
@@ -998,6 +1147,7 @@ def main(args):
         accelerator.print(
             f"[MODE] EEG-only clean dataset | stage={args.training_stage} | "
             f"use_sife={args.use_sife} | use_recon={args.use_eeg_reconstruction} | "
+            f"use_stage1_clip={args.use_stage1_clip_pretrain} | "
             f"use_ssfe={args.use_ssfe} | use_prior={args.use_prior}"
         )
 
@@ -1062,10 +1212,13 @@ def main(args):
                 sife_loss_inv = zero
                 sife_loss_spec = zero
                 recon_loss = zero
+                stage1_clip_loss = zero
+                stage1_clip_top1 = zero
                 image_cls_loss = zero
                 image_dis_loss = zero
                 anchor_cls_loss = zero
                 anchor_visual_loss = zero
+                anchor_visual_s_loss = zero
                 anchor_text_loss = zero
                 ssfe_loss = zero
                 prior_loss = zero
@@ -1136,6 +1289,45 @@ def main(args):
                         recon_loss = F.l1_loss(eeg_recon, eeg_cond.float())
                     else:
                         raise ValueError(f"Unsupported recon_loss_type: {args.recon_loss_type}")
+                    
+                if stage1_clip_projector is not None and (is_stage1 or is_full):
+                    clip_target = batch["clip_img_embeds"].to(
+                        accelerator.device,
+                        dtype=torch.float32,
+                    )
+
+                    if clip_target.ndim != 3:
+                        raise RuntimeError(
+                            f"Expected clip_img_embeds shape (B,T,D), got {tuple(clip_target.shape)}"
+                        )
+
+                    visual_group_ids = get_group_ids_from_batch(
+                        batch,
+                        "visual_group_ids",
+                        accelerator.device,
+                    )
+
+                    stage1_clip_pred = stage1_clip_projector(E_seq.float())
+
+                    stage1_clip_loss = multi_positive_sequence_info_nce_loss(
+                        stage1_clip_pred.float(),
+                        clip_target.float(),
+                        group_ids=visual_group_ids,
+                        temperature=args.stage1_clip_temperature,
+                        exclude_self=False,
+                    )
+
+                    pred_flat = F.normalize(
+                        stage1_clip_pred.float().reshape(stage1_clip_pred.shape[0], -1),
+                        dim=-1,
+                    )
+                    tgt_flat = F.normalize(
+                        clip_target.float().reshape(clip_target.shape[0], -1),
+                        dim=-1,
+                    )
+                    sim = pred_flat @ tgt_flat.t()
+                    top1_group = visual_group_ids[sim.argmax(dim=1)]
+                    stage1_clip_top1 = (top1_group == visual_group_ids).float().mean()
 
                 if ssfe_projector is not None and (is_stage2 or is_stage2_joint or is_full):
                     if E_i_seq is None:
@@ -1159,7 +1351,7 @@ def main(args):
                     image_dis_acc = (pred_image_dis.argmax(dim=-1) == image_labels).float().mean()
                     anchor_cls_acc = (pred_image_cls_anchor.argmax(dim=-1) == image_labels).float().mean()
 
-                    if args.lambda_anchor_visual > 0.0:
+                    if args.lambda_anchor_visual > 0.0 or args.lambda_anchor_visual_s > 0.0:
                         visual_group_ids = get_group_ids_from_batch(
                             batch,
                             "visual_group_ids",
@@ -1175,13 +1367,23 @@ def main(args):
                                 f"Expected clip_img_embeds shape (B,T,D), got {tuple(clip_target.shape)}"
                             )
 
-                        anchor_visual_loss = multi_positive_sequence_info_nce_loss(
-                            F_anchor_visual.float(),
-                            clip_target.float(),
-                            group_ids=visual_group_ids,
-                            temperature=args.anchor_visual_temperature,
-                            exclude_self=False,
-                        )
+                        if args.lambda_anchor_visual > 0.0:
+                            anchor_visual_loss = multi_positive_sequence_info_nce_loss(
+                                F_anchor_visual.float(),
+                                clip_target.float(),
+                                group_ids=visual_group_ids,
+                                temperature=args.anchor_visual_temperature,
+                                exclude_self=False,
+                            )
+
+                        if args.lambda_anchor_visual_s > 0.0:
+                            anchor_visual_s_loss = multi_positive_sequence_info_nce_loss(
+                                F_s.float(),
+                                clip_target.float(),
+                                group_ids=visual_group_ids,
+                                temperature=args.anchor_visual_temperature,
+                                exclude_self=False,
+                            )
 
                     if args.lambda_anchor_text > 0.0:
                         text_group_ids = get_group_ids_from_batch(
@@ -1207,6 +1409,7 @@ def main(args):
                         + float(args.lambda_image_dis) * image_dis_loss
                         + float(args.lambda_anchor_cls) * anchor_cls_loss
                         + float(args.lambda_anchor_visual) * anchor_visual_loss
+                        + float(args.lambda_anchor_visual_s) * anchor_visual_s_loss
                         + float(args.lambda_anchor_text) * anchor_text_loss
                     )
 
@@ -1253,6 +1456,9 @@ def main(args):
                 if recon_decoder is not None and (is_stage1 or is_full):
                     loss_total = loss_total + float(args.lambda_recon) * recon_loss
 
+                if stage1_clip_projector is not None and (is_stage1 or is_full):
+                    loss_total = loss_total + float(args.lambda_stage1_clip) * stage1_clip_loss
+
                 if ssfe_projector is not None and (is_stage2 or is_stage2_joint or is_full):
                     loss_total = loss_total + float(args.lambda_ssfe) * ssfe_loss
 
@@ -1295,6 +1501,8 @@ def main(args):
                     "acc_subject_inv_gap_vs_random": inv_acc_gap_vs_random.item(),
                     "acc_subject_spec_gap_vs_random": spec_acc_gap_vs_random.item(),
                     "loss_recon": recon_loss.item(),
+                    "loss_stage1_clip": stage1_clip_loss.item(),
+                    "stage1_clip_top1": stage1_clip_top1.item(),
                     "loss_ssfe": ssfe_loss.item(),
                     "loss_image_cls": image_cls_loss.item(),
                     "loss_image_dis": image_dis_loss.item(),
@@ -1303,6 +1511,7 @@ def main(args):
                     "loss_anchor_cls": anchor_cls_loss.item(),
                     "acc_anchor_cls": anchor_cls_acc.item(),
                     "loss_anchor_visual": anchor_visual_loss.item(),
+                    "loss_anchor_visual_s": anchor_visual_s_loss.item(),
                     "loss_anchor_text": anchor_text_loss.item(),
                     "loss_prior": prior_loss.item(),
                     "epoch": current_epoch,
@@ -1323,10 +1532,13 @@ def main(args):
                         f"inv_acc={values['acc_subject_inv']:.4f} | "
                         f"spec_acc={values['acc_subject_spec']:.4f} | "
                         f"recon={values['loss_recon']:.4f} | "
+                        f"stage1_clip={values['loss_stage1_clip']:.4f} | "
+                        f"stage1_top1={values['stage1_clip_top1']:.4f} | "
                         f"ssfe={values['loss_ssfe']:.4f} | "
                         f"img_cls={values['loss_image_cls']:.4f} | "
                         f"img_dis={values['loss_image_dis']:.4f} | "
                         f"anchor_v={values['loss_anchor_visual']:.4f} | "
+                        f"anchor_vs={values['loss_anchor_visual_s']:.4f} | "
                         f"anchor_t={values['loss_anchor_text']:.4f} | "
                         f"prior={values['loss_prior']:.4f}"
                     )
@@ -1339,6 +1551,7 @@ def main(args):
                         eeg_backbone,
                         sife,
                         recon_decoder,
+                        stage1_clip_projector,
                         ssfe_projector,
                         diffusion_prior,
                         subject_to_local,
@@ -1428,6 +1641,25 @@ def main(args):
                 },
             )
 
+        if stage1_clip_projector is not None:
+            stage1_clip_unwrapped = accelerator.unwrap_model(stage1_clip_projector)
+            torch.save(
+                stage1_clip_unwrapped.state_dict(),
+                os.path.join(args.output_dir, "stage1_clip_projector.pt"),
+            )
+            save_json(
+                os.path.join(args.output_dir, "stage1_clip_projector_config.json"),
+                {
+                    "in_dim": int(args.eeg_backbone_hidden_size),
+                    "hidden_dim": int(args.stage1_clip_hidden_dim),
+                    "out_dim": int(args.stage1_clip_out_dim),
+                    "target_tokens": int(args.stage1_clip_target_tokens),
+                    "adapter_type": args.stage1_clip_adapter_type,
+                    "lambda_stage1_clip": float(args.lambda_stage1_clip),
+                    "stage1_clip_temperature": float(args.stage1_clip_temperature),
+                },
+            )
+
         if ssfe_projector is not None:
             ssfe_unwrapped = accelerator.unwrap_model(ssfe_projector)
             torch.save(ssfe_unwrapped.state_dict(), os.path.join(args.output_dir, "ssfe_projector.pt"))
@@ -1447,6 +1679,7 @@ def main(args):
                     "lambda_image_dis": float(args.lambda_image_dis),
                     "lambda_anchor_cls": float(args.lambda_anchor_cls),
                     "lambda_anchor_visual": float(args.lambda_anchor_visual),
+                    "lambda_anchor_visual_s": float(args.lambda_anchor_visual_s),
                     "lambda_anchor_text": float(args.lambda_anchor_text),
                     "anchor_visual_temperature": float(args.anchor_visual_temperature),
                     "anchor_text_temperature": float(args.anchor_text_temperature),
@@ -1467,6 +1700,7 @@ def main(args):
                     "prior_heads": int(args.prior_heads),
                     "prior_timesteps": int(args.prior_timesteps),
                     "prior_cond_drop_prob": float(args.prior_cond_drop_prob),
+                    "use_image_embed_scale": False,
                 },
             )
 
