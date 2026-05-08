@@ -525,13 +525,9 @@ class ImageDiscriminator(nn.Module):
         if x.ndim != 3:
             raise ValueError(f"ImageDiscriminator expects (B, T, D), got {tuple(x.shape)}")
 
-        x_rev = self.grl(x)
-
-        # ZEBRA-style: GRL only on the attention-score path
-        attn_weights = self.attn_proj(x_rev)
+        x = self.grl(x)
+        attn_weights = self.attn_proj(x)
         attn_weights = torch.softmax(attn_weights, dim=1)
-
-        # Pool the original features, as in ZEBRA
         x_weighted = (attn_weights * x).sum(dim=1)
         logits = self.classifier(x_weighted)
         return logits
