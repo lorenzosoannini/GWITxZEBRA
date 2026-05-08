@@ -510,8 +510,8 @@ def parse_args(input_args=None):
     parser.add_argument("--lambda_anchor_visual", type=float, default=0.0)
     parser.add_argument("--lambda_anchor_visual_s", type=float, default=0.0)
     parser.add_argument("--lambda_anchor_text", type=float, default=0.0)
-    parser.add_argument("--anchor_visual_temperature", type=float, default=0.07)
-    parser.add_argument("--anchor_text_temperature", type=float, default=0.07)
+    parser.add_argument("--anchor_visual_temperature", type=float, default=0.1)
+    parser.add_argument("--anchor_text_temperature", type=float, default=0.1)
 
     # Prior
     parser.add_argument("--use_prior", action="store_true")
@@ -971,7 +971,7 @@ def main(args):
         prior_network = PriorNetwork(
             dim=prior_dim,
             num_tokens=prior_num_tokens,
-            num_timesteps=int(args.prior_timesteps),
+            num_timesteps=None,
             depth=int(args.prior_depth),
             heads=int(args.prior_heads),
             dim_head=52,
