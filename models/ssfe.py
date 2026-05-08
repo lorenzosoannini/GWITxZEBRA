@@ -505,19 +505,16 @@ class ImageClassifier(nn.Module):
 
 
 class ImageDiscriminator(nn.Module):
-    """
-    ZEBRA-like adversarial image discriminator.
-    GRL is applied exactly before the same attention-pool classifier head.
-    """
-
     def __init__(
         self,
         embed_dim: int = 1664,
         num_classes: int = 40,
         grl_lambda: float = 1.0,
+        grl_mode: str = "full",  # "full" oppure "zebra_attn"
     ):
         super().__init__()
         self.grl = GRL(lambda_=grl_lambda)
+        self.grl_mode = grl_mode
         self.attn_proj = nn.Linear(embed_dim, 1)
         self.classifier = nn.Linear(embed_dim, num_classes)
 
@@ -525,16 +522,23 @@ class ImageDiscriminator(nn.Module):
         if x.ndim != 3:
             raise ValueError(f"ImageDiscriminator expects (B, T, D), got {tuple(x.shape)}")
 
-        x_rev = self.grl(x)
+        if self.grl_mode == "full":
+            x_rev = self.grl(x)
+            attn_weights = self.attn_proj(x_rev)
+            attn_weights = torch.softmax(attn_weights, dim=1)
+            x_weighted = (attn_weights * x_rev).sum(dim=1)
+            logits = self.classifier(x_weighted)
+            return logits
 
-        # ZEBRA-style: GRL only on the attention-score path
-        attn_weights = self.attn_proj(x_rev)
-        attn_weights = torch.softmax(attn_weights, dim=1)
+        if self.grl_mode == "zebra_attn":
+            x_rev = self.grl(x)
+            attn_weights = self.attn_proj(x_rev)
+            attn_weights = torch.softmax(attn_weights, dim=1)
+            x_weighted = (attn_weights * x).sum(dim=1)
+            logits = self.classifier(x_weighted)
+            return logits
 
-        # Pool the original features, as in ZEBRA
-        x_weighted = (attn_weights * x).sum(dim=1)
-        logits = self.classifier(x_weighted)
-        return logits
+        raise ValueError(f"Unsupported grl_mode: {self.grl_mode}")
 
 
 class AnchorTextProjector(nn.Module):
@@ -591,6 +595,7 @@ class SSFEProjector(nn.Module):
         grl_lambda: float = 1.0,
         num_image_classes: int = 40,
         text_out_dim: int = 1280,
+        image_dis_grl_mode: str = "full",
     ):
         super().__init__()
 
@@ -627,6 +632,7 @@ class SSFEProjector(nn.Module):
             embed_dim=out_dim,
             num_classes=num_image_classes,
             grl_lambda=grl_lambda,
+            grl_mode=image_dis_grl_mode,
         )
 
         self.anchor_text_projector = AnchorTextProjector(

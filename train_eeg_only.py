@@ -504,6 +504,12 @@ def parse_args(input_args=None):
     parser.add_argument("--lambda_image_cls", type=float, default=1.0)
     parser.add_argument("--lambda_image_dis", type=float, default=1.0)
     parser.add_argument("--gradient_checkpointing_ssfe", action="store_true")
+    parser.add_argument(
+        "--image_dis_grl_mode",
+        type=str,
+        default="zebra_attn",
+        choices=["full", "zebra_attn"],
+    )
 
     # Anchor losses
     parser.add_argument("--lambda_anchor_cls", type=float, default=0.0)
@@ -898,6 +904,7 @@ def main(args):
             num_image_classes=args.num_image_classes,
             grl_lambda=args.grl_lambda_ssfe,
             text_out_dim=anchor_text_dim,
+            image_dis_grl_mode=args.image_dis_grl_mode,
         )
 
         if args.gradient_checkpointing_ssfe:
