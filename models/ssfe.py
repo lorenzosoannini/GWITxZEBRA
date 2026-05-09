@@ -223,6 +223,7 @@ class _SimpleSequenceAdapter(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = _maybe_resize_tokens(x, self.target_tokens)
         y = self.token_mlp(x)
+        y = F.normalize(y, dim=-1)
         return y
 
 
@@ -382,6 +383,7 @@ class _ZebraLikeSequenceAdapter(nn.Module):
         x = _maybe_resize_tokens(x, self.target_tokens)
         x = self.bottleneck(x)
         x = self.broadcaster(x)
+        x = F.normalize(x, dim=-1)
         return x
 
 
@@ -561,6 +563,7 @@ class AnchorTextProjector(nn.Module):
 
         x = torch.mean(x, dim=1)   # (B, in_dim)
         x = x @ self.proj          # (B, out_dim)
+        x = F.normalize(x, dim=-1)
         return x
 
 
