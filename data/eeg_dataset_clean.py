@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from datasets import load_dataset, concatenate_datasets
+import json
 
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
@@ -107,6 +108,24 @@ def _resolve_subject_subdir(root_dir, dataset_name, subj):
         f"  {candidate_2}"
     )
 
+def _resolve_visual_ids_path(root_dir, dataset_name):
+    safe_name = _safe_dataset_name(dataset_name)
+
+    candidates = [
+        os.path.join(root_dir, "visual_ids", safe_name, "visual_ids_by_subject.json"),
+        os.path.join(root_dir, safe_name, "visual_ids_by_subject.json"),
+        os.path.join(root_dir, "visual_ids_by_subject.json"),
+    ]
+
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+
+    raise FileNotFoundError(
+        "Could not find visual_ids_by_subject.json under:\n"
+        + "\n".join(f"  {p}" for p in candidates)
+    )
+
 
 # ---------------------------------------------------------
 # EEG-only dataset
@@ -182,6 +201,37 @@ class EEGImageDataset(Dataset):
 
         self.val_ratio = float(val_ratio)
         self.split_seed = int(split_seed)
+
+        self.use_image_hash_visual_ids = bool(
+            getattr(args, "use_image_hash_visual_ids", False)
+        )
+        self.visual_ids_by_subject = None
+
+        if self.use_image_hash_visual_ids:
+            visual_ids_root = getattr(args, "visual_ids_root", None)
+            if visual_ids_root is None:
+                visual_ids_root = getattr(args, "data_root", None)
+
+            if visual_ids_root is None:
+                raise ValueError(
+                    "--use_image_hash_visual_ids requires --visual_ids_root or --data_root"
+                )
+
+            visual_ids_path = _resolve_visual_ids_path(
+                root_dir=visual_ids_root,
+                dataset_name=dataset_name,
+            )
+
+            with open(visual_ids_path, "r") as f:
+                payload = json.load(f)
+
+            self.visual_ids_by_subject = payload["visual_ids_by_subject"]
+
+            print(f"[EEG DATASET] Loaded hash-based visual IDs from: {visual_ids_path}")
+            print(
+                f"[EEG DATASET] num_unique_images_global="
+                f"{payload.get('num_unique_images_global', 'NA')}"
+            )
 
         if self.subset_mode == "train":
             self.max_samples_per_subject = getattr(args, "max_train_samples_per_subject", None)
@@ -394,16 +444,32 @@ class EEGImageDataset(Dataset):
         # ---------------------------------------------------------
         # Group IDs for multi-positive contrastive losses
         # ---------------------------------------------------------
-        # Instance-level visual id.
+        # visual_group_ids:
+        #   - if use_image_hash_visual_ids=True:
+        #       image-level ID computed offline from raw RGB image hash.
+        #       Same image across subjects gets the same visual_group_id.
+        #   - otherwise:
+        #       conservative subject-specific instance ID.
         #
-        # Old GWIT-style code hashed the raw image. Here we intentionally avoid
-        # loading images. This id is stable and collision-free for practical
-        # subject/local-index ranges.
-        #
-        # Meaning:
-        #   - visual_group_ids: instance-level positives
-        #   - text_group_ids: class-level positives
-        visual_group_id = int(subj) * 1_000_000 + int(local_idx)
+        # text_group_ids:
+        #   class-level ID from the dataset label.
+        if self.use_image_hash_visual_ids:
+            subj_key = str(int(subj))
+            if subj_key not in self.visual_ids_by_subject:
+                raise KeyError(f"Missing subject {subj_key} in visual_ids_by_subject")
+
+            visual_ids_for_subj = self.visual_ids_by_subject[subj_key]
+
+            if int(local_idx) >= len(visual_ids_for_subj):
+                raise IndexError(
+                    f"local_idx={local_idx} out of range for subject {subj}; "
+                    f"visual_ids length={len(visual_ids_for_subj)}"
+                )
+
+            visual_group_id = int(visual_ids_for_subj[int(local_idx)])
+        else:
+            visual_group_id = int(subj) * 1_000_000 + int(local_idx)
+
         text_group_id = int(example["label"])
 
         out = {

@@ -450,6 +450,9 @@ def parse_args(input_args=None):
     parser.add_argument("--split_seed", type=int, default=42)
     parser.add_argument("--validation_steps", type=int, default=100)
 
+    parser.add_argument("--use_image_hash_visual_ids", action="store_true")
+    parser.add_argument("--visual_ids_root", type=str, default=None)
+
     # Precomputed CLIP embeds
     parser.add_argument("--use_precomputed_clip_embeds", action="store_true")
     parser.add_argument("--clip_embeds_dir", type=str, default=None)
