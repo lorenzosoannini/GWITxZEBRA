@@ -139,7 +139,7 @@ class EEGImageDataset(Dataset):
       - no input_ids
       - no caption classifier
       - no caption_text
-      - no pixel_values
+      - no pixel_values by default; optional only with return_pixel_values=True
       - no VAE latents
       - no posterior_mean/posterior_logvar
 
@@ -190,6 +190,8 @@ class EEGImageDataset(Dataset):
         self.subjects = _normalize_subject_list(subjects)
         self.subset_mode = subset_mode
         self.cond_column = conditioning_image_column
+        self.image_column = getattr(args, "image_column", "image")
+        self.return_pixel_values = bool(getattr(args, "return_pixel_values", False))
         self.args = args
         self.root = root
         self.accelerator = accelerator
@@ -479,6 +481,37 @@ class EEGImageDataset(Dataset):
             "visual_group_ids": torch.tensor(visual_group_id, dtype=torch.long),
             "text_group_ids": torch.tensor(text_group_id, dtype=torch.long),
         }
+
+        # ---------------------------------------------------------
+        # Optional GT RGB image for debug/reconstruction scripts
+        # ---------------------------------------------------------
+        if self.return_pixel_values:
+            if self.image_column not in example:
+                raise KeyError(
+                    f"return_pixel_values=True but image_column='{self.image_column}' "
+                    f"not found in dataset example. Available keys: {list(example.keys())}"
+                )
+
+            img = example[self.image_column]
+
+            # Hugging Face Image columns usually return PIL.Image.
+            # Convert to RGB and then to CHW tensor in [-1, 1],
+            # matching the old StageA expectation.
+            if hasattr(img, "convert"):
+                img = img.convert("RGB")
+
+            img_arr = np.array(img, dtype=np.float32)
+
+            if img_arr.ndim != 3 or img_arr.shape[-1] != 3:
+                raise ValueError(
+                    f"Expected RGB image with shape (H, W, 3), got {img_arr.shape}"
+                )
+
+            img_arr = img_arr / 255.0
+            img_arr = (img_arr * 2.0) - 1.0          # [0,1] -> [-1,1]
+            img_arr = np.transpose(img_arr, (2, 0, 1))  # HWC -> CHW
+
+            out["pixel_values"] = torch.from_numpy(img_arr).float()
 
         # ---------------------------------------------------------
         # Optional precomputed CLIP image/text embeddings
