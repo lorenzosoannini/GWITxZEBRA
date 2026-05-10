@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -347,12 +346,7 @@ class _ZebraLikeSequenceAdapter(nn.Module):
       2. token mixing on sequence dimension
       3. channel projection
       4. channel-wise attention refinement
-      5. optional learnable output scale
-
-    Important:
-      Original ZEBRA does NOT apply token-wise L2 normalization here.
-      We therefore avoid F.normalize(x, dim=-1), but use a learnable scale
-      initialized small to prevent early norm explosion.
+      5. L2 normalization
     """
 
     def __init__(
@@ -363,15 +357,9 @@ class _ZebraLikeSequenceAdapter(nn.Module):
         target_tokens: int = 256,
         dropout: float = 0.1,   # kept for interface compatibility; unused here
         num_heads: int = 1,
-        use_learnable_output_scale: bool = True,
-        init_output_scale: float = 0.1,
-        max_output_scale: float = 10.0,
     ):
         super().__init__()
         self.target_tokens = int(target_tokens)
-
-        self.use_learnable_output_scale = bool(use_learnable_output_scale)
-        self.max_output_scale = float(max_output_scale)
 
         seq_hidden_dim = max(hidden_dim, self.target_tokens)
 
@@ -387,17 +375,6 @@ class _ZebraLikeSequenceAdapter(nn.Module):
             num_heads=num_heads,
         )
 
-        if self.use_learnable_output_scale:
-            init_output_scale = float(init_output_scale)
-            if init_output_scale <= 0:
-                raise ValueError(f"init_output_scale must be > 0, got {init_output_scale}")
-
-            self.log_output_scale = nn.Parameter(
-                torch.tensor(math.log(init_output_scale), dtype=torch.float32)
-            )
-        else:
-            self.register_parameter("log_output_scale", None)
-
     def set_gradient_checkpointing(self, enable: bool = True):
         self.bottleneck.set_gradient_checkpointing(enable)
         self.broadcaster.set_gradient_checkpointing(enable)
@@ -406,13 +383,7 @@ class _ZebraLikeSequenceAdapter(nn.Module):
         x = _maybe_resize_tokens(x, self.target_tokens)
         x = self.bottleneck(x)
         x = self.broadcaster(x)
-
-        # Do NOT token-wise normalize here.
-        # Let the representation learn its own scale, but start conservatively.
-        if self.log_output_scale is not None:
-            scale = self.log_output_scale.exp().clamp(max=self.max_output_scale)
-            x = x * scale
-
+        x = F.normalize(x, dim=-1)
         return x
 
 
@@ -441,9 +412,6 @@ def _build_sequence_adapter(
             target_tokens=target_tokens,
             dropout=dropout,
             num_heads=1,
-            use_learnable_output_scale=True,
-            init_output_scale=0.1,
-            max_output_scale=10.0,
         )
 
     raise ValueError(f"Unsupported adapter_type: {adapter_type}")
