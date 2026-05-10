@@ -1732,6 +1732,7 @@ def main(args):
                     "num_image_classes": int(args.num_image_classes),
                     "grl_lambda_ssfe": float(args.grl_lambda_ssfe),
                     "text_out_dim": int(anchor_text_dim),
+                    "image_dis_grl_mode": args.image_dis_grl_mode,
                     "lambda_ssfe": float(args.lambda_ssfe),
                     "lambda_image_cls": float(args.lambda_image_cls),
                     "lambda_image_dis": float(args.lambda_image_dis),
