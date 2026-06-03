@@ -8,7 +8,7 @@ from datasets import load_dataset, concatenate_datasets
 
 
 DATASET_NAME = "luigi-s/EEG_Image_CVPR_ALL_subj"
-OUTPUT_DIR = "/workspace/data/visual_ids"
+OUTPUT_DIR = "visual_ids"
 OUTPUT_PATH = os.path.join(
     OUTPUT_DIR,
     DATASET_NAME.replace("/", "_"),

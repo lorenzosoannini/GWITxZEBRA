@@ -28,7 +28,8 @@ from models.ssfe import (
     multi_positive_info_nce_loss,
     multi_positive_sequence_info_nce_loss,
 )
-from models.prior import PriorNetwork, BrainDiffusionPrior
+from diffusers import AutoencoderKL
+from models.prior import build_zebra_prior, BlurryReconDecoder
 
 if is_wandb_available():
     import wandb  # noqa: F401
@@ -88,6 +89,8 @@ def run_validation_metrics(
     stage1_clip_projector,
     ssfe_projector,
     diffusion_prior,
+    blurry_recon_decoder,
+    blurry_autoenc,
     subject_to_local,
     args,
     accelerator,
@@ -99,6 +102,8 @@ def run_validation_metrics(
         "stage1_clip_projector": stage1_clip_projector.training if stage1_clip_projector is not None else None,
         "ssfe_projector": ssfe_projector.training if ssfe_projector is not None else None,
         "diffusion_prior": diffusion_prior.training if diffusion_prior is not None else None,
+        "blurry_recon_decoder": blurry_recon_decoder.training if blurry_recon_decoder is not None else None,
+        "blurry_autoenc": blurry_autoenc.training if blurry_autoenc is not None else None,
     }
 
     eeg_backbone.eval()
@@ -112,6 +117,10 @@ def run_validation_metrics(
         ssfe_projector.eval()
     if diffusion_prior is not None:
         diffusion_prior.eval()
+    if blurry_recon_decoder is not None:
+        blurry_recon_decoder.eval()
+    if blurry_autoenc is not None:
+        blurry_autoenc.eval()
 
     device = accelerator.device
     names = [
@@ -132,12 +141,14 @@ def run_validation_metrics(
         "acc_image_cls",
         "acc_image_dis",
         "anchor_cls_loss",
+        "acc_anchor_cls",
         "anchor_visual_loss",
         "anchor_visual_s_loss",
         "loss_anchor_text",
         "anchor_top1",
         "anchor_s_top1",
         "prior_loss",
+        "loss_blurry",
     ]
     acc = {name: torch.tensor(0.0, device=device) for name in names}
 
@@ -251,10 +262,12 @@ def run_validation_metrics(
 
                 acc_image_cls = (pred_image_cls.argmax(dim=-1) == image_labels).float().mean()
                 acc_image_dis = (pred_image_dis.argmax(dim=-1) == image_labels).float().mean()
+                acc_anchor_cls = (pred_image_cls_anchor.argmax(dim=-1) == image_labels).float().mean()
 
                 acc["loss_image_cls"] += loss_image_cls * bsz_t
                 acc["loss_image_dis"] += loss_image_dis * bsz_t
                 acc["anchor_cls_loss"] += loss_anchor_cls * bsz_t
+                acc["acc_anchor_cls"] += acc_anchor_cls * bsz_t
                 acc["acc_image_cls"] += acc_image_cls * bsz_t
                 acc["acc_image_dis"] += acc_image_dis * bsz_t
 
@@ -323,11 +336,39 @@ def run_validation_metrics(
 
                 if diffusion_prior is not None:
                     clip_target = batch["clip_img_embeds"].to(device, dtype=torch.float32)
-                    prior_loss, _ = diffusion_prior(
+                    prior_loss, prior_pred = diffusion_prior(
                         text_embed=F_s.float(),
                         image_embed=clip_target.float(),
                     )
                     acc["prior_loss"] += prior_loss * bsz_t
+
+                    if blurry_recon_decoder is not None:
+                        if blurry_autoenc is None:
+                            raise RuntimeError("blurry_recon_decoder is enabled but blurry_autoenc is None.")
+                        if "pixel_values" not in batch:
+                            raise RuntimeError(
+                                "Blurry recon validation requires batch['pixel_values']. "
+                                "Make sure args.return_pixel_values=True."
+                            )
+
+                        pixel_values = batch["pixel_values"].to(device, dtype=torch.float32)
+
+                        # Dataset returns [-1, 1], matching AutoencoderKL.encode input.
+                        image_enc = blurry_autoenc.encode(pixel_values).latent_dist.mode() * 0.18215
+
+                        blurry_pred, _ = blurry_recon_decoder(prior_pred.float())
+
+                        if blurry_pred.shape != image_enc.shape:
+                            raise RuntimeError(
+                                f"Validation blurry latent shape mismatch: "
+                                f"blurry_pred={tuple(blurry_pred.shape)} vs "
+                                f"image_enc={tuple(image_enc.shape)}. "
+                                "Check GT image resolution and autoencoder latent size."
+                            )
+
+                        loss_blurry = F.l1_loss(blurry_pred.float(), image_enc.float())
+
+                        acc["loss_blurry"] += loss_blurry * bsz_t
 
     gathered = accelerator.gather_for_metrics(
         torch.stack([acc[name] for name in names]).unsqueeze(0)
@@ -358,15 +399,19 @@ def run_validation_metrics(
         "val/acc_image_dis": (summed[15] / total_global).item(),
 
         "val/anchor_cls_loss": (summed[16] / total_global).item(),
-        "val/anchor_visual_loss": (summed[17] / total_global).item(),
-        "val/anchor_visual_s_loss": (summed[18] / total_global).item(),
-        "val/loss_anchor_text": (summed[19] / total_global).item(),
-        "val/anchor_top1": (summed[20] / total_global).item(),
-        "val/anchor_s_top1": (summed[21] / total_global).item(),
+        "val/acc_anchor_cls": (summed[17] / total_global).item(),
+        "val/anchor_visual_loss": (summed[18] / total_global).item(),
+        "val/anchor_visual_s_loss": (summed[19] / total_global).item(),
+        "val/loss_anchor_text": (summed[20] / total_global).item(),
+        "val/anchor_top1": (summed[21] / total_global).item(),
+        "val/anchor_s_top1": (summed[22] / total_global).item(),
     }
 
     if diffusion_prior is not None:
-        metrics["val/prior_loss"] = (summed[22] / total_global).item()
+        metrics["val/prior_loss"] = (summed[23] / total_global).item()
+
+    if blurry_recon_decoder is not None:
+        metrics["val/loss_blurry"] = (summed[24] / total_global).item()
 
     eeg_backbone.train(previous_modes["eeg_backbone"])
     if sife is not None:
@@ -379,6 +424,10 @@ def run_validation_metrics(
         ssfe_projector.train(previous_modes["ssfe_projector"])
     if diffusion_prior is not None:
         diffusion_prior.train(previous_modes["diffusion_prior"])
+    if blurry_recon_decoder is not None:
+        blurry_recon_decoder.train(previous_modes["blurry_recon_decoder"])
+    if blurry_autoenc is not None:
+        blurry_autoenc.eval()
 
     return metrics
 
@@ -414,6 +463,7 @@ def parse_args(input_args=None):
     parser.add_argument("--recon_lr", type=float, default=None)
     parser.add_argument("--ssfe_lr", type=float, default=None)
     parser.add_argument("--prior_lr", type=float, default=None)
+    parser.add_argument("--blurry_lr", type=float, default=None)
 
     parser.add_argument("--lr_scheduler", type=str, default="constant")
     parser.add_argument("--lr_warmup_steps", type=int, default=500)
@@ -528,10 +578,15 @@ def parse_args(input_args=None):
     parser.add_argument("--prior_num_tokens", type=int, default=None)
     parser.add_argument("--prior_dim", type=int, default=None)
     parser.add_argument("--prior_depth", type=int, default=6)
-    parser.add_argument("--prior_heads", type=int, default=32)
     parser.add_argument("--prior_timesteps", type=int, default=100)
     parser.add_argument("--prior_cond_drop_prob", type=float, default=0.2)
     parser.add_argument("--gradient_checkpointing_prior", action="store_true")
+
+    # Blurry reconstruction decoder, ZEBRA-style
+    parser.add_argument("--use_blurry_recon", action="store_true")
+    parser.add_argument("--blurry_autoenc_path", type=str, default=None)
+    parser.add_argument("--lambda_blurry", type=float, default=0.5)
+    parser.add_argument("--blurry_vision_dim", type=int, default=1664)
 
     # Staged training
     parser.add_argument(
@@ -561,6 +616,11 @@ def parse_args(input_args=None):
         raise ValueError("--use_prior requires --use_ssfe")
     if args.use_prior and not args.use_precomputed_clip_embeds:
         raise ValueError("--use_prior requires --use_precomputed_clip_embeds")
+    if args.use_blurry_recon:
+        if not args.use_prior:
+            raise ValueError("--use_blurry_recon requires --use_prior")
+        if args.blurry_autoenc_path is None:
+            raise ValueError("--use_blurry_recon requires --blurry_autoenc_path")
     if args.use_stage1_clip_pretrain and not args.use_precomputed_clip_embeds:
         raise ValueError("--use_stage1_clip_pretrain requires --use_precomputed_clip_embeds")
 
@@ -619,6 +679,9 @@ def parse_args(input_args=None):
             raise ValueError("stage3 requires --load_sife_path and --load_ssfe_path")
         if args.eeg_backbone_ckpt is None:
             raise ValueError("stage3 requires --eeg_backbone_ckpt")
+        
+    if args.use_blurry_recon:
+        args.return_pixel_values = True
 
     return args
 
@@ -978,42 +1041,77 @@ def main(args):
                 f"prior_dim={prior_dim}, but dataset dim={inferred_clip_dim}"
             )
 
-        prior_network = PriorNetwork(
-            dim=prior_dim,
-            num_tokens=prior_num_tokens,
-            num_timesteps=None,
-            depth=int(args.prior_depth),
-            heads=int(args.prior_heads),
-            dim_head=52,
-            ff_mult=4,
-            attn_dropout=0.0,
-            ff_dropout=0.0,
-            norm_in=False,
-            norm_out=True,
-            final_proj=True,
-            normformer=False,
-            causal=False,
-            learned_query_mode="pos_emb",
-        )
+        if prior_dim != 1664:
+            raise ValueError(
+                f"ZEBRA/dalle2 prior is currently configured for dim=1664, got prior_dim={prior_dim}"
+            )
+        if prior_num_tokens != 256:
+            raise ValueError(
+                f"ZEBRA/dalle2 prior is currently configured for 256 tokens, got prior_num_tokens={prior_num_tokens}"
+            )
 
-        if args.gradient_checkpointing_prior and hasattr(prior_network, "set_gradient_checkpointing"):
-            prior_network.set_gradient_checkpointing(True)
-            accelerator.print("[PRIOR] gradient checkpointing enabled")
-
-        diffusion_prior = BrainDiffusionPrior(
-            net=prior_network,
-            image_embed_dim=prior_dim,
+        diffusion_prior = build_zebra_prior(
+            clip_seq_dim=prior_num_tokens,
+            clip_emb_dim=prior_dim,
             timesteps=int(args.prior_timesteps),
             cond_drop_prob=float(args.prior_cond_drop_prob),
-            predict_x_start=True,
-            training_clamp_l2norm=False,
-            sampling_clamp_l2norm=False,
-            use_image_embed_scale=False,
+            depth=int(args.prior_depth),
+            use_gradient_checkpointing=bool(args.gradient_checkpointing_prior),
         )
+
+        # Important: keep model fp32. Accelerator/autocast handles mixed precision.
+        diffusion_prior.float()
+
+        if args.gradient_checkpointing_prior:
+            diffusion_prior.set_gradient_checkpointing(True)
+            accelerator.print("[PRIOR] gradient checkpointing enabled")
 
         if args.load_prior_path is not None:
             diffusion_prior.load_state_dict(torch.load(args.load_prior_path, map_location="cpu"))
             accelerator.print(f"[LOAD] Loaded prior from {args.load_prior_path}")
+
+    blurry_recon_decoder = None
+    blurry_autoenc = None
+
+    if args.use_blurry_recon:
+        if diffusion_prior is None:
+            raise RuntimeError("--use_blurry_recon requires diffusion_prior to be initialized.")
+
+        if prior_dim != int(args.blurry_vision_dim):
+            raise ValueError(
+                f"blurry_vision_dim={args.blurry_vision_dim}, but prior_dim={prior_dim}. "
+                "BlurryReconDecoder vision_dim must match prior output dim."
+            )
+
+        blurry_recon_decoder = BlurryReconDecoder(
+            vision_dim=int(args.blurry_vision_dim),
+        )
+
+        blurry_autoenc = AutoencoderKL(
+            down_block_types=[
+                "DownEncoderBlock2D",
+                "DownEncoderBlock2D",
+                "DownEncoderBlock2D",
+                "DownEncoderBlock2D",
+            ],
+            up_block_types=[
+                "UpDecoderBlock2D",
+                "UpDecoderBlock2D",
+                "UpDecoderBlock2D",
+                "UpDecoderBlock2D",
+            ],
+            block_out_channels=[128, 256, 512, 512],
+            layers_per_block=2,
+            sample_size=224,
+        )
+
+        autoenc_state = torch.load(args.blurry_autoenc_path, map_location="cpu")
+        blurry_autoenc.load_state_dict(autoenc_state)
+        blurry_autoenc.eval()
+        blurry_autoenc.requires_grad_(False)
+
+        accelerator.print(f"[BLURRY] Loaded autoencoder from {args.blurry_autoenc_path}")
+        accelerator.print("[BLURRY] BlurryReconDecoder enabled")
 
     is_stage1 = args.training_stage == "stage1"
     is_stage2 = args.training_stage == "stage2"
@@ -1028,6 +1126,7 @@ def main(args):
         set_trainable(stage1_clip_projector, True)
         set_trainable(ssfe_projector, False)
         set_trainable(diffusion_prior, False)
+        set_trainable(blurry_recon_decoder, False)
     elif is_stage2:
         set_trainable(eeg_backbone, False)
         set_trainable(sife, False)
@@ -1035,6 +1134,7 @@ def main(args):
         set_trainable(stage1_clip_projector, False)
         set_trainable(ssfe_projector, True)
         set_trainable(diffusion_prior, False)
+        set_trainable(blurry_recon_decoder, False)
     elif is_stage2_joint:
         set_trainable(eeg_backbone, False)
         set_trainable(sife, False)
@@ -1042,6 +1142,7 @@ def main(args):
         set_trainable(stage1_clip_projector, False)
         set_trainable(ssfe_projector, True)
         set_trainable(diffusion_prior, True)
+        set_trainable(blurry_recon_decoder, bool(args.use_blurry_recon))
     elif is_stage3:
         set_trainable(eeg_backbone, False)
         set_trainable(sife, False)
@@ -1049,6 +1150,7 @@ def main(args):
         set_trainable(stage1_clip_projector, False)
         set_trainable(ssfe_projector, False)
         set_trainable(diffusion_prior, True)
+        set_trainable(blurry_recon_decoder, bool(args.use_blurry_recon))
     else:
         set_trainable(eeg_backbone, True)
         set_trainable(sife, True)
@@ -1056,6 +1158,8 @@ def main(args):
         set_trainable(stage1_clip_projector, True)
         set_trainable(ssfe_projector, True)
         set_trainable(diffusion_prior, True)
+        set_trainable(blurry_recon_decoder, bool(args.use_blurry_recon))
+    set_trainable(blurry_autoenc, False)
 
     lr_main = float(args.learning_rate)
     lr_eeg = float(args.eeg_backbone_lr) if args.eeg_backbone_lr is not None else lr_main
@@ -1064,6 +1168,7 @@ def main(args):
     lr_stage1_clip = float(args.stage1_clip_lr) if args.stage1_clip_lr is not None else lr_main
     lr_ssfe = float(args.ssfe_lr) if args.ssfe_lr is not None else lr_main
     lr_prior = float(args.prior_lr) if args.prior_lr is not None else lr_main
+    lr_blurry = float(args.blurry_lr) if args.blurry_lr is not None else lr_main
 
     module_param_specs = [
         ("eeg", eeg_backbone, lr_eeg),
@@ -1072,6 +1177,7 @@ def main(args):
         ("stage1_clip", stage1_clip_projector, lr_stage1_clip),
         ("ssfe", ssfe_projector, lr_ssfe),
         ("prior", diffusion_prior, lr_prior),
+        ("blurry", blurry_recon_decoder, lr_blurry),
     ]
 
     param_groups = []
@@ -1118,6 +1224,8 @@ def main(args):
         prepare_items.append(ssfe_projector)
     if diffusion_prior is not None:
         prepare_items.append(diffusion_prior)
+    if blurry_recon_decoder is not None:
+        prepare_items.append(blurry_recon_decoder)
     prepare_items += [optimizer, train_dataloader, val_dataloader, lr_scheduler]
 
     prepared = accelerator.prepare(*prepare_items)
@@ -1140,6 +1248,9 @@ def main(args):
     if diffusion_prior is not None:
         diffusion_prior = prepared[idx]
         idx += 1
+    if blurry_recon_decoder is not None:
+        blurry_recon_decoder = prepared[idx]
+        idx += 1
     optimizer = prepared[idx]
     idx += 1
     train_dataloader = prepared[idx]
@@ -1147,9 +1258,20 @@ def main(args):
     val_dataloader = prepared[idx]
     idx += 1
     lr_scheduler = prepared[idx]
+    if blurry_autoenc is not None:
+        blurry_autoenc.to(accelerator.device, dtype=torch.float32)
+        blurry_autoenc.eval()
 
     accum_models = []
-    for module in [eeg_backbone, sife, recon_decoder, stage1_clip_projector, ssfe_projector, diffusion_prior]:
+    for module in [
+        eeg_backbone,
+        sife,
+        recon_decoder,
+        stage1_clip_projector,
+        ssfe_projector,
+        diffusion_prior,
+        blurry_recon_decoder,
+    ]:
         if module is not None and any(p.requires_grad for p in module.parameters()):
             accum_models.append(module)
 
@@ -1191,9 +1313,20 @@ def main(args):
         )
 
     # Keep trainable EEG modules in fp32. Mixed precision is still handled by Accelerator.
-    for module in [eeg_backbone, sife, recon_decoder, stage1_clip_projector, ssfe_projector, diffusion_prior]:
+    for module in [
+        eeg_backbone,
+        sife,
+        recon_decoder,
+        stage1_clip_projector,
+        ssfe_projector,
+        diffusion_prior,
+        blurry_recon_decoder,
+    ]:
         if module is not None:
             module.to(accelerator.device, dtype=torch.float32)
+    if blurry_autoenc is not None:
+        blurry_autoenc.to(accelerator.device, dtype=torch.float32)
+        blurry_autoenc.eval()
 
     if accelerator.is_main_process:
         if args.report_to is not None:
@@ -1206,7 +1339,8 @@ def main(args):
             f"[MODE] EEG-only clean dataset | stage={args.training_stage} | "
             f"use_sife={args.use_sife} | use_recon={args.use_eeg_reconstruction} | "
             f"use_stage1_clip={args.use_stage1_clip_pretrain} | "
-            f"use_ssfe={args.use_ssfe} | use_prior={args.use_prior}"
+            f"use_ssfe={args.use_ssfe} | use_prior={args.use_prior} | "
+            f"use_blurry_recon={args.use_blurry_recon}"
         )
 
     progress_bar = tqdm(
@@ -1280,6 +1414,7 @@ def main(args):
                 anchor_text_loss = zero
                 ssfe_loss = zero
                 prior_loss = zero
+                blurry_loss = zero
 
                 inv_acc = zero
                 spec_acc = zero
@@ -1497,6 +1632,41 @@ def main(args):
                         image_embed=clip_target.float(),
                     )
 
+                    if blurry_recon_decoder is not None:
+                        if blurry_autoenc is None:
+                            raise RuntimeError("Blurry recon is enabled but blurry_autoenc is None.")
+                        if "pixel_values" not in batch:
+                            raise RuntimeError(
+                                "Blurry recon requires batch['pixel_values']. "
+                                "Make sure args.return_pixel_values=True."
+                            )
+
+                        pixel_values = batch["pixel_values"].to(
+                            accelerator.device,
+                            dtype=torch.float32,
+                        )
+
+                        with torch.no_grad():
+                            image_enc = blurry_autoenc.encode(pixel_values).latent_dist.mode() * 0.18215
+
+                        blurry_pred, _ = blurry_recon_decoder(prior_pred.float())
+
+                        if not debug_printed_once and accelerator.is_main_process:
+                            accelerator.print(f"[DEBUG] pixel_values: {tuple(pixel_values.shape)}")
+                            accelerator.print(f"[DEBUG] image_enc: {tuple(image_enc.shape)}")
+                            accelerator.print(f"[DEBUG] prior_pred: {tuple(prior_pred.shape)}")
+                            accelerator.print(f"[DEBUG] blurry_pred: {tuple(blurry_pred.shape)}")
+
+                        if blurry_pred.shape != image_enc.shape:
+                            raise RuntimeError(
+                                f"Blurry latent shape mismatch: "
+                                f"blurry_pred={tuple(blurry_pred.shape)} vs "
+                                f"image_enc={tuple(image_enc.shape)}. "
+                                "Check GT image resolution and autoencoder latent size."
+                            )
+
+                        blurry_loss = F.l1_loss(blurry_pred.float(), image_enc.float())
+
                 if not debug_printed_once and accelerator.is_main_process:
                     accelerator.print(f"[DEBUG] E_seq: {tuple(E_seq.shape)} | E_pooled: {tuple(E_pooled.shape)}")
                     if E_i_seq is not None:
@@ -1522,6 +1692,9 @@ def main(args):
 
                 if diffusion_prior is not None and (is_stage3 or is_stage2_joint or is_full):
                     loss_total = loss_total + float(args.lambda_prior) * prior_loss
+
+                if blurry_recon_decoder is not None and (is_stage3 or is_stage2_joint or is_full):
+                    loss_total = loss_total + float(args.lambda_blurry) * blurry_loss
 
                 accelerator.backward(loss_total)
 
@@ -1572,6 +1745,7 @@ def main(args):
                     "loss_anchor_visual_s": anchor_visual_s_loss.item(),
                     "loss_anchor_text": anchor_text_loss.item(),
                     "loss_prior": prior_loss.item(),
+                    "loss_blurry": blurry_loss.item(),
                     "epoch": current_epoch,
                 }
 
@@ -1598,7 +1772,8 @@ def main(args):
                         f"anchor_v={values['loss_anchor_visual']:.4f} | "
                         f"anchor_vs={values['loss_anchor_visual_s']:.4f} | "
                         f"anchor_t={values['loss_anchor_text']:.4f} | "
-                        f"prior={values['loss_prior']:.4f}"
+                        f"prior={values['loss_prior']:.4f} | "
+                        f"blurry={values['loss_blurry']:.4f}"
                     )
 
                 accelerator.log(values, step=global_step)
@@ -1612,6 +1787,8 @@ def main(args):
                         stage1_clip_projector,
                         ssfe_projector,
                         diffusion_prior,
+                        blurry_recon_decoder,
+                        blurry_autoenc,
                         subject_to_local,
                         args,
                         accelerator,
@@ -1757,10 +1934,26 @@ def main(args):
                     "prior_num_tokens": int(prior_num_tokens),
                     "prior_dim": int(prior_dim),
                     "prior_depth": int(args.prior_depth),
-                    "prior_heads": int(args.prior_heads),
+                    "prior_heads": int(prior_dim // 52),
                     "prior_timesteps": int(args.prior_timesteps),
                     "prior_cond_drop_prob": float(args.prior_cond_drop_prob),
                     "use_image_embed_scale": False,
+                    "gradient_checkpointing_prior": bool(args.gradient_checkpointing_prior),
+                },
+            )
+
+        if blurry_recon_decoder is not None:
+            blurry_unwrapped = accelerator.unwrap_model(blurry_recon_decoder)
+            torch.save(
+                blurry_unwrapped.state_dict(),
+                os.path.join(args.output_dir, "blurry_recon_decoder.pt"),
+            )
+            save_json(
+                os.path.join(args.output_dir, "blurry_recon_decoder_config.json"),
+                {
+                    "vision_dim": int(args.blurry_vision_dim),
+                    "lambda_blurry": float(args.lambda_blurry),
+                    "blurry_autoenc_path": args.blurry_autoenc_path,
                 },
             )
 
